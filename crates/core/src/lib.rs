@@ -1,0 +1,356 @@
+pub mod commands;
+pub mod events;
+pub mod state;
+pub mod workspace;
+
+use std::path::PathBuf;
+use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::{fs, time::Duration};
+
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{broadcast, mpsc};
+
+use protocol::{AttentionLevel, Command, Event, WorkspaceSummary};
+use state::{AppState, Workspace};
+use uuid::Uuid;
+use workspace::git::{diff_file, refresh_git};
+use workspace::terminal::{start_terminal, TerminalOutput, TerminalSession};
+
+#[derive(Clone)]
+pub struct CoreHandle {
+    pub cmd_tx: mpsc::Sender<Command>,
+    pub evt_tx: broadcast::Sender<Event>,
+}
+
+pub fn spawn_core() -> CoreHandle {
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(256);
+    let (evt_tx, _) = broadcast::channel::<Event>(256);
+    let evt_tx_task = evt_tx.clone();
+
+    tokio::spawn(async move {
+        let mut state = AppState::default();
+        restore_workspaces(&mut state, &evt_tx_task).await;
+        let _ = evt_tx_task.send(Event::WorkspaceList {
+            items: workspace_summaries(&state),
+        });
+        let mut git_tick = tokio::time::interval(Duration::from_secs(2));
+
+        loop {
+            tokio::select! {
+                maybe_cmd = cmd_rx.recv() => {
+                    let Some(cmd) = maybe_cmd else { break; };
+                    match cmd {
+                Command::SetRoute(route) => state.route = route,
+                Command::AddWorkspace { name, path } => {
+                    let id = Uuid::new_v4();
+                    let repo_path = std::path::PathBuf::from(path);
+                    let initial_git = refresh_git(&repo_path).await.unwrap_or_default();
+                    let ws = Workspace {
+                        id,
+                        name,
+                        path: repo_path,
+                        git: initial_git.clone(),
+                        attention: AttentionLevel::None,
+                        terminals: Default::default(),
+                        last_activity: Instant::now(),
+                    };
+                    state.ordered_ids.push(id);
+                    state.workspaces.insert(id, ws);
+                    let _ = evt_tx_task.send(Event::WorkspaceGitUpdated {
+                        id,
+                        git: initial_git,
+                    });
+                }
+                Command::RemoveWorkspace { id } => {
+                    state.workspaces.remove(&id);
+                    state.ordered_ids.retain(|wid| *wid != id);
+                }
+                Command::RenameWorkspace { id, name } => {
+                    if let Some(ws) = state.workspaces.get_mut(&id) {
+                        ws.name = name;
+                        ws.last_activity = Instant::now();
+                    }
+                }
+                Command::SetAttention { id, level } => {
+                    if let Some(ws) = state.workspaces.get_mut(&id) {
+                        ws.attention = level;
+                        let _ = evt_tx_task.send(Event::WorkspaceAttentionChanged { id, level });
+                    }
+                }
+                Command::ClearAttention { id } => {
+                    if let Some(ws) = state.workspaces.get_mut(&id) {
+                        ws.attention = AttentionLevel::None;
+                        let _ = evt_tx_task.send(Event::WorkspaceAttentionChanged {
+                            id,
+                            level: AttentionLevel::None,
+                        });
+                    }
+                }
+                Command::RefreshGit { id } => {
+                    if let Some(path) = state.workspaces.get(&id).map(|ws| ws.path.clone()) {
+                        match refresh_git(&path).await {
+                            Ok(git) => {
+                                if let Some(ws) = state.workspaces.get_mut(&id) {
+                                    ws.git = git.clone();
+                                    ws.last_activity = Instant::now();
+                                }
+                                let _ = evt_tx_task.send(Event::WorkspaceGitUpdated { id, git });
+                            }
+                            Err(err) => {
+                                let _ = evt_tx_task.send(Event::Error {
+                                    message: format!(
+                                        "RefreshGit failed for {}: {err}",
+                                        path.display()
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+                Command::LoadDiff { id, file } => {
+                    if let Some(path) = state.workspaces.get(&id).map(|ws| ws.path.clone()) {
+                        match diff_file(&path, &file).await {
+                            Ok(diff) => {
+                                let _ = evt_tx_task.send(Event::WorkspaceDiffUpdated {
+                                    id,
+                                    file,
+                                    diff,
+                                });
+                            }
+                            Err(err) => {
+                                let _ = evt_tx_task.send(Event::Error {
+                                    message: format!(
+                                        "LoadDiff failed for {}: {err}",
+                                        path.display()
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+                Command::StartTerminal { id, kind, cmd } => {
+                    if let Some(ws) = state.workspaces.get_mut(&id) {
+                        let cwd = ws.path.clone();
+                        let command = if cmd.is_empty() {
+                            default_terminal_cmd(kind)
+                        } else {
+                            cmd
+                        };
+
+                        if let Some(existing) = terminal_slot_mut(ws, kind).take() {
+                            let _ = existing.stop().await;
+                        }
+
+                        match start_terminal(cwd, command).await {
+                            Ok((session, mut out_rx)) => {
+                                *terminal_slot_mut(ws, kind) = Some(session);
+                                ws.last_activity = Instant::now();
+                                let _ = evt_tx_task.send(Event::TerminalStarted { id, kind });
+
+                                let evt_tx_outputs = evt_tx_task.clone();
+                                tokio::spawn(async move {
+                                    while let Some(out) = out_rx.recv().await {
+                                        match out {
+                                            TerminalOutput::Bytes(bytes) => {
+                                                let data_b64 =
+                                                    base64::engine::general_purpose::STANDARD
+                                                        .encode(bytes);
+                                                let _ =
+                                                    evt_tx_outputs.send(Event::TerminalOutput {
+                                                        id,
+                                                        kind,
+                                                        data_b64,
+                                                    });
+                                            }
+                                            TerminalOutput::Exited(code) => {
+                                                let _ = evt_tx_outputs
+                                                    .send(Event::TerminalExited { id, kind, code });
+                                                break;
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                            Err(err) => {
+                                let _ = evt_tx_task.send(Event::Error {
+                                    message: format!(
+                                        "StartTerminal failed for workspace {id}: {err}"
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+                Command::StopTerminal { id, kind } => {
+                    if let Some(ws) = state.workspaces.get_mut(&id) {
+                        if let Some(session) = terminal_slot_mut(ws, kind).take() {
+                            let _ = session.stop().await;
+                            let _ = evt_tx_task.send(Event::TerminalExited {
+                                id,
+                                kind,
+                                code: None,
+                            });
+                        }
+                    }
+                }
+                Command::SendTerminalInput { id, kind, data_b64 } => {
+                    if let Some(ws) = state.workspaces.get_mut(&id) {
+                        if let Some(session) = terminal_slot_mut(ws, kind).as_mut() {
+                            if let Ok(bytes) =
+                                base64::engine::general_purpose::STANDARD.decode(data_b64)
+                            {
+                                let _ = session.send_input(&bytes).await;
+                            }
+                        }
+                    }
+                }
+                Command::ResizeTerminal {
+                    id,
+                    kind,
+                    cols,
+                    rows,
+                } => {
+                    if let Some(ws) = state.workspaces.get_mut(&id) {
+                        if let Some(session) = terminal_slot_mut(ws, kind).as_mut() {
+                            let _ = session.resize(cols, rows).await;
+                        }
+                    }
+                }
+            }
+
+            save_workspaces(&state);
+            let items = workspace_summaries(&state);
+            let _ = evt_tx_task.send(Event::WorkspaceList { items });
+                }
+                _ = git_tick.tick() => {
+                    let ids = state.ordered_ids.clone();
+                    for id in ids {
+                        if let Some(path) = state.workspaces.get(&id).map(|ws| ws.path.clone()) {
+                            if let Ok(git) = refresh_git(&path).await {
+                                if let Some(ws) = state.workspaces.get_mut(&id) {
+                                    ws.git = git.clone();
+                                }
+                                let _ = evt_tx_task.send(Event::WorkspaceGitUpdated { id, git });
+                            }
+                        }
+                    }
+                    let _ = evt_tx_task.send(Event::WorkspaceList {
+                        items: workspace_summaries(&state),
+                    });
+                }
+            }
+        }
+    });
+
+    CoreHandle { cmd_tx, evt_tx }
+}
+
+fn workspace_summaries(state: &AppState) -> Vec<WorkspaceSummary> {
+    state
+        .ordered_ids
+        .iter()
+        .filter_map(|id| state.workspaces.get(id))
+        .map(|ws| WorkspaceSummary {
+            id: ws.id,
+            name: ws.name.clone(),
+            path: ws.path.display().to_string(),
+            branch: ws.git.branch.clone(),
+            dirty_files: ws.git.changed.len(),
+            attention: ws.attention,
+            agent_running: ws.terminals.agent.is_some(),
+            shell_running: ws.terminals.shell.is_some(),
+            last_activity_unix_ms: unix_ms_now(),
+        })
+        .collect::<Vec<_>>()
+}
+
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn terminal_slot_mut(
+    ws: &mut Workspace,
+    kind: protocol::TerminalKind,
+) -> &mut Option<TerminalSession> {
+    match kind {
+        protocol::TerminalKind::Agent => &mut ws.terminals.agent,
+        protocol::TerminalKind::Shell => &mut ws.terminals.shell,
+    }
+}
+
+fn default_terminal_cmd(kind: protocol::TerminalKind) -> Vec<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "zsh".to_string());
+    match kind {
+        protocol::TerminalKind::Agent => vec![shell.clone(), "-i".to_string()],
+        protocol::TerminalKind::Shell => vec![shell, "-i".to_string()],
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedWorkspace {
+    name: String,
+    path: String,
+}
+
+fn persist_file() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".config/multiws/workspaces.json"))
+}
+
+fn save_workspaces(state: &AppState) {
+    let Some(path) = persist_file() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let items = state
+        .ordered_ids
+        .iter()
+        .filter_map(|id| state.workspaces.get(id))
+        .map(|ws| PersistedWorkspace {
+            name: ws.name.clone(),
+            path: ws.path.display().to_string(),
+        })
+        .collect::<Vec<_>>();
+    if let Ok(json) = serde_json::to_string_pretty(&items) {
+        let _ = fs::write(path, json);
+    }
+}
+
+async fn restore_workspaces(state: &mut AppState, evt_tx: &broadcast::Sender<Event>) {
+    let Some(path) = persist_file() else {
+        return;
+    };
+    let Ok(raw) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(items) = serde_json::from_str::<Vec<PersistedWorkspace>>(&raw) else {
+        return;
+    };
+    for item in items {
+        let id = Uuid::new_v4();
+        let repo_path = PathBuf::from(item.path);
+        let initial_git = refresh_git(&repo_path).await.unwrap_or_default();
+        let ws = Workspace {
+            id,
+            name: item.name,
+            path: repo_path,
+            git: initial_git.clone(),
+            attention: AttentionLevel::None,
+            terminals: Default::default(),
+            last_activity: Instant::now(),
+        };
+        state.ordered_ids.push(id);
+        state.workspaces.insert(id, ws);
+        let _ = evt_tx.send(Event::WorkspaceGitUpdated {
+            id,
+            git: initial_git,
+        });
+    }
+}
