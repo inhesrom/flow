@@ -987,6 +987,11 @@ fn apply_event(app: &mut TuiApp, evt: CoreEvent) {
         } => {
             app.git_action_message = Some((message, std::time::Instant::now()));
         }
+        CoreEvent::WorkspaceAttentionChanged { id, level } => {
+            if let Some(ws) = app.workspaces.iter_mut().find(|w| w.id == id) {
+                ws.attention = level;
+            }
+        }
         _ => {}
     }
 }

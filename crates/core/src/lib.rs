@@ -392,29 +392,36 @@ pub fn spawn_core() -> CoreHandle {
                                     const SETTLE_MS: u64 = 500;
 
                                     let is_agent = matches!(kind, protocol::TerminalKind::Agent);
-                                    let mut settle_armed = false;
+                                    let mut settle_deadline: Option<tokio::time::Instant> = None;
 
                                     loop {
-                                        let out = if is_agent && settle_armed {
-                                            tokio::select! {
-                                                maybe_out = out_rx.recv() => {
-                                                    // New output arrived before settle timeout —
-                                                    // reset the timer by continuing the loop.
-                                                    maybe_out
-                                                }
-                                                _ = tokio::time::sleep(Duration::from_millis(SETTLE_MS)) => {
-                                                    settle_armed = false;
-                                                    if detector.check_for_prompt() {
-                                                        attention_active = true;
-                                                        let _ = cmd_tx_outputs
-                                                            .send(Command::SetAttention {
-                                                                id,
-                                                                level: AttentionLevel::NeedsInput,
-                                                            })
-                                                            .await;
+                                        let out = if is_agent {
+                                            if let Some(deadline) = settle_deadline {
+                                                tokio::select! {
+                                                    maybe_out = out_rx.recv() => { maybe_out }
+                                                    _ = tokio::time::sleep_until(deadline) => {
+                                                        settle_deadline = None;
+                                                        if detector.check_for_prompt() {
+                                                            if !attention_active {
+                                                                attention_active = true;
+                                                                let _ = cmd_tx_outputs
+                                                                    .send(Command::SetAttention {
+                                                                        id,
+                                                                        level: AttentionLevel::NeedsInput,
+                                                                    })
+                                                                    .await;
+                                                            }
+                                                        } else if attention_active {
+                                                            attention_active = false;
+                                                            let _ = cmd_tx_outputs
+                                                                .send(Command::ClearAttention { id })
+                                                                .await;
+                                                        }
+                                                        continue;
                                                     }
-                                                    continue;
                                                 }
+                                            } else {
+                                                out_rx.recv().await
                                             }
                                         } else {
                                             out_rx.recv().await
@@ -425,15 +432,20 @@ pub fn spawn_core() -> CoreHandle {
                                         match out {
                                             TerminalOutput::Bytes(bytes) => {
                                                 if is_agent {
-                                                    if attention_active {
-                                                        attention_active = false;
-                                                        let _ = cmd_tx_outputs
-                                                            .send(Command::ClearAttention { id })
-                                                            .await;
+                                                    let has_content = detector.append(&bytes);
+                                                    if has_content {
+                                                        settle_deadline = Some(
+                                                            tokio::time::Instant::now()
+                                                                + Duration::from_millis(SETTLE_MS),
+                                                        );
+                                                        if attention_active {
+                                                            attention_active = false;
+                                                            let _ = cmd_tx_outputs
+                                                                .send(Command::ClearAttention { id })
+                                                                .await;
+                                                        }
                                                     }
-                                                    if detector.append(&bytes) {
-                                                        settle_armed = true;
-                                                    }
+                                                    // ANSI-only: has_content=false → settle_deadline unchanged
                                                 }
                                                 let data_b64 =
                                                     base64::engine::general_purpose::STANDARD

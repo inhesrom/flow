@@ -63,7 +63,7 @@ impl AttentionDetector {
             return true;
         }
         // Fallback: agent asked a question and output has settled
-        if tail.ends_with('?') {
+        if has_sentence_ending_question(tail) {
             self.buffer.clear();
             return true;
         }
@@ -91,16 +91,42 @@ fn tail_str(s: &str, max_bytes: usize) -> &str {
     &s[start..]
 }
 
+/// Returns `true` if `c` is a Unicode character used for terminal UI decoration
+/// (box drawing, block elements, dingbats, etc.) that should be treated as
+/// whitespace during prompt matching normalization.
+fn is_terminal_decoration(c: char) -> bool {
+    matches!(c,
+        '\u{2500}'..='\u{257F}' |  // Box Drawing (─│┃┌┐└┘├┤┬┴┼ etc.)
+        '\u{2580}'..='\u{259F}' |  // Block Elements (▀▄█▌▐▛▜▝ etc.)
+        '\u{2300}'..='\u{23FF}' |  // Miscellaneous Technical (⏺⌘ etc.)
+        '\u{2700}'..='\u{27BF}'    // Dingbats (❯✓✗ etc.)
+    )
+}
+
 fn normalize_for_match(input: &str) -> String {
     let no_ansi = strip_ansi(input);
     no_ansi
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_ascii_control() { ' ' } else { c })
+        .map(|c| if c.is_ascii_control() || is_terminal_decoration(c) { ' ' } else { c })
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Returns `true` if `s` contains a `?` immediately preceded by an alphanumeric
+/// character, indicating a genuine sentence-ending question rather than a
+/// standalone `?` used as a shortcut hint (e.g. "? for shortcuts").
+fn has_sentence_ending_question(s: &str) -> bool {
+    let mut prev_alnum = false;
+    for c in s.chars() {
+        if c == '?' && prev_alnum {
+            return true;
+        }
+        prev_alnum = c.is_alphanumeric();
+    }
+    false
 }
 
 fn strip_ansi(input: &str) -> String {
@@ -133,6 +159,11 @@ fn strip_ansi(input: &str) -> String {
                             break;
                         }
                     }
+                }
+                Some('(' | ')' | '*' | '+') => {
+                    // SCS (Select Character Set): ESC <designator> <charset-char>
+                    let _ = chars.next(); // consume designator
+                    let _ = chars.next(); // consume charset character
                 }
                 _ => {
                     let _ = chars.next();
@@ -305,10 +336,10 @@ mod tests {
     }
 
     #[test]
-    fn question_mark_not_at_end_no_match() {
+    fn question_mark_mid_text_matches() {
         let mut det = AttentionDetector::new();
         det.append(b"What went wrong? Let me investigate");
-        assert!(!det.check_for_prompt());
+        assert!(det.check_for_prompt());
     }
 
     #[test]
@@ -328,5 +359,130 @@ mod tests {
     fn strip_ansi_handles_dcs() {
         let result = strip_ansi("before\x1bPq#0;2;0;0;0\x1b\\after");
         assert_eq!(result, "beforeafter");
+    }
+
+    // --- Real-world ANSI output tests ---
+
+    #[test]
+    fn claude_code_permission_prompt_with_ansi() {
+        let mut det = AttentionDetector::new();
+        det.append(
+            b"\x1b[1;33mThis command requires approval\x1b[0m\n\x1b[36mAllow once\x1b[0m",
+        );
+        assert!(det.check_for_prompt());
+    }
+
+    #[test]
+    fn claude_code_yes_no_with_ansi() {
+        let mut det = AttentionDetector::new();
+        det.append(b"\x1b[1mProceed?\x1b[0m \x1b[2m(y/n)\x1b[0m");
+        assert!(det.check_for_prompt());
+    }
+
+    #[test]
+    fn claude_code_tab_to_amend() {
+        let mut det = AttentionDetector::new();
+        // Box-drawing chars + ANSI colour
+        det.append(b"\xe2\x94\x8c\xe2\x94\x80\xe2\x94\x80 \x1b[34mTab to amend\x1b[0m");
+        assert!(det.check_for_prompt());
+    }
+
+    #[test]
+    fn no_false_positive_ansi_normal_output() {
+        let mut det = AttentionDetector::new();
+        det.append(b"\x1b[32m\xe2\x9c\x93 All tests passed\x1b[0m\n\x1b[32mBuild successful\x1b[0m");
+        assert!(!det.check_for_prompt());
+    }
+
+    #[test]
+    fn approve_command_with_osc_suffix() {
+        let mut det = AttentionDetector::new();
+        det.append(b"Approve command\x1b]133;D\x07\x1b]133;A\x07");
+        assert!(det.check_for_prompt());
+    }
+
+    #[test]
+    fn question_in_ansi_colored_output() {
+        let mut det = AttentionDetector::new();
+        det.append(b"\x1b[1;37mShould I apply this change?\x1b[0m");
+        assert!(det.check_for_prompt());
+    }
+
+    #[test]
+    fn multiple_appends_then_settle() {
+        let mut det = AttentionDetector::new();
+        det.append(b"\x1b[33mThis command ");
+        det.append(b"requires ");
+        det.append(b"approval\x1b[0m");
+        assert!(det.check_for_prompt());
+    }
+
+    #[test]
+    fn waiting_for_input_with_osc_title() {
+        let mut det = AttentionDetector::new();
+        det.append(b"\x1b]0;claude-code\x07\x1b[1mWaiting for your input\x1b[0m");
+        assert!(det.check_for_prompt());
+    }
+
+    #[test]
+    fn strip_ansi_handles_scs_g0() {
+        // ESC ( B — Select Character Set G0 to ASCII
+        let result = strip_ansi("hello\x1b(Bworld");
+        assert_eq!(result, "helloworld");
+    }
+
+    #[test]
+    fn strip_ansi_handles_scs_g1() {
+        // ESC ) 0 — Select Character Set G1 to DEC Special Graphics
+        let result = strip_ansi("hello\x1b)0world");
+        assert_eq!(result, "helloworld");
+    }
+
+    #[test]
+    fn trailing_question_mark_after_scs_matches() {
+        let mut det = AttentionDetector::new();
+        det.append(b"What can I help you with today?\x1b(B");
+        assert!(det.check_for_prompt());
+    }
+
+    #[test]
+    fn trailing_question_mark_with_whitespace_matches() {
+        let mut det = AttentionDetector::new();
+        det.append(b"Should I proceed?  \t\n");
+        assert!(det.check_for_prompt());
+    }
+
+    #[test]
+    fn claude_code_idle_prompt_detected() {
+        let mut det = AttentionDetector::new();
+        // Simulate: question text + box-drawing border + status bar
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"what can i help you with today? ");
+        // 155 box-drawing chars (─ = 0xe2 0x94 0x80, 3 bytes each)
+        for _ in 0..155 {
+            buf.extend_from_slice("\u{2500}".as_bytes());
+        }
+        buf.extend_from_slice(b" ? for shortcuts | Update available! Run: brew upgrade claude-code");
+        det.append(&buf);
+        assert!(det.check_for_prompt());
+    }
+
+    #[test]
+    fn decoration_only_returns_no_content() {
+        let mut det = AttentionDetector::new();
+        // Pure box-drawing output should normalize to empty → has_content = false
+        let mut buf = Vec::new();
+        for _ in 0..50 {
+            buf.extend_from_slice("\u{2500}".as_bytes());
+        }
+        let has_content = det.append(&buf);
+        assert!(!has_content);
+    }
+
+    #[test]
+    fn standalone_question_mark_no_match() {
+        let mut det = AttentionDetector::new();
+        det.append(b"? for shortcuts");
+        assert!(!det.check_for_prompt());
     }
 }

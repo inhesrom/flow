@@ -8,7 +8,8 @@ use ratatui::{
 
 use crate::app::TuiApp;
 use crate::ui::footer;
-use protocol::Route;
+use crate::ui::widgets::tile_grid::ORANGE;
+use protocol::{AttentionLevel, Route};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceHit {
@@ -88,31 +89,128 @@ fn layout(area: Rect, focus: crate::app::Focus) -> WorkspaceLayout {
     }
 }
 
+/// Returns the standard focused/unfocused border style used by all non-attention panes.
+fn standard_border_style(focused: bool) -> (Style, BorderType) {
+    if focused {
+        (
+            Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
+            BorderType::Thick,
+        )
+    } else {
+        (
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::DIM),
+            BorderType::Plain,
+        )
+    }
+}
+
+/// Computes the border style for the terminal pane, accounting for attention level.
+///
+/// When the workspace has an active attention state (`NeedsInput` or `Error`) and
+/// `flash_on` is true, the border flashes in the corresponding colour.  Otherwise
+/// the standard focused / unfocused styling is used.
+pub fn pane_border_style(
+    focused: bool,
+    attention: AttentionLevel,
+    flash_on: bool,
+) -> (Style, BorderType) {
+    match attention {
+        AttentionLevel::NeedsInput if flash_on => (
+            Style::default()
+                .fg(ORANGE)
+                .add_modifier(Modifier::BOLD),
+            BorderType::Thick,
+        ),
+        AttentionLevel::Error if flash_on => (
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+            BorderType::Thick,
+        ),
+        _ => standard_border_style(focused),
+    }
+}
+
+/// Returns the border style for a terminal tab, accounting for attention state and selection.
+fn tab_border_style(
+    is_active: bool,
+    is_agent: bool,
+    attention: AttentionLevel,
+    flash_on: bool,
+    selected_style: Style,
+) -> (Style, BorderType) {
+    if is_active
+        && is_agent
+        && matches!(attention, AttentionLevel::NeedsInput | AttentionLevel::Error)
+        && flash_on
+    {
+        let color = match attention {
+            AttentionLevel::Error => Color::Red,
+            _ => ORANGE,
+        };
+        (
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+            BorderType::Thick,
+        )
+    } else if is_active {
+        (selected_style, BorderType::Thick)
+    } else {
+        (
+            Style::default().add_modifier(Modifier::DIM),
+            BorderType::Plain,
+        )
+    }
+}
+
+/// Builds the title `Line` for the terminal pane, with an optional attention badge.
+pub fn build_terminal_title_line(attention: AttentionLevel, flash_on: bool) -> Line<'static> {
+    match attention {
+        AttentionLevel::NeedsInput => {
+            let badge_style = if flash_on {
+                Style::default()
+                    .fg(ORANGE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(ORANGE)
+            };
+            Line::from(vec![
+                Span::raw("Terminal "),
+                Span::styled("⚠ input", badge_style),
+            ])
+        }
+        AttentionLevel::Error => {
+            let badge_style = if flash_on {
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Red)
+            };
+            Line::from(vec![
+                Span::raw("Terminal "),
+                Span::styled("✖ error", badge_style),
+            ])
+        }
+        _ => Line::from("Terminal"),
+    }
+}
+
 pub fn render(frame: &mut Frame, area: Rect, app: &TuiApp) {
     let l = layout(area, app.focus);
-
-    let focused_border = |focused: bool| -> (Style, BorderType) {
-        if focused {
-            (
-                Style::default()
-                    .fg(Color::LightBlue)
-                    .add_modifier(Modifier::BOLD),
-                BorderType::Thick,
-            )
-        } else {
-            (
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::DIM),
-                BorderType::Plain,
-            )
-        }
-    };
 
     let ws_id = match app.route {
         Route::Workspace { id } => Some(id),
         _ => None,
     };
+    let attention = ws_id
+        .and_then(|id| app.workspaces.iter().find(|w| w.id == id))
+        .map(|w| w.attention)
+        .unwrap_or(AttentionLevel::None);
+
     let title = ws_id
         .and_then(|id| app.workspaces.iter().find(|w| w.id == id))
         .map(|w| {
@@ -140,7 +238,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &TuiApp) {
         .unwrap_or_else(|| "Workspace".to_string());
 
     let (header_style, header_border_type) =
-        focused_border(app.focus == crate::app::Focus::WsHeader);
+        standard_border_style(app.focus == crate::app::Focus::WsHeader);
     frame.render_widget(
         Paragraph::new(if let Some(name) = &app.rename_workspace_input {
             format!("{title}\nRename: {name}")
@@ -188,7 +286,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &TuiApp) {
         })
         .collect::<Vec<_>>();
     let (files_style, files_border_type) =
-        focused_border(app.focus == crate::app::Focus::WsFiles);
+        standard_border_style(app.focus == crate::app::Focus::WsFiles);
     let file_list = List::new(file_items)
         .block(
             Block::default()
@@ -230,7 +328,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &TuiApp) {
             ]))
         })
         .collect::<Vec<_>>();
-    let (log_style, log_border_type) = focused_border(app.focus == crate::app::Focus::WsLog);
+    let (log_style, log_border_type) = standard_border_style(app.focus == crate::app::Focus::WsLog);
     let commit_list = List::new(commit_items)
         .block(
             Block::default()
@@ -436,7 +534,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &TuiApp) {
         })
         .collect::<Vec<_>>();
     let (diff_style, diff_border_type) =
-        focused_border(app.focus == crate::app::Focus::WsDiff);
+        standard_border_style(app.focus == crate::app::Focus::WsDiff);
     frame.render_widget(
         Paragraph::new(diff_lines)
             .block(
@@ -481,14 +579,14 @@ pub fn render(frame: &mut Frame, area: Rect, app: &TuiApp) {
         } else {
             tab.label.clone()
         };
-        let (tab_style, tab_border_type) = if i == app.ws_active_tab {
-            (selected_style, BorderType::Thick)
-        } else {
-            (
-                Style::default().add_modifier(Modifier::DIM),
-                BorderType::Plain,
-            )
-        };
+        let is_agent = matches!(tab.kind, protocol::TerminalKind::Agent);
+        let (tab_style, tab_border_type) = tab_border_style(
+            i == app.ws_active_tab,
+            is_agent,
+            attention,
+            app.flash_on,
+            selected_style,
+        );
         frame.render_widget(
             Paragraph::new(format!(
                 "{}\n{}\n[h/l] [n new] [x close] [r rename]",
@@ -511,12 +609,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &TuiApp) {
         .map(|id| app.terminal_lines(id, &app.active_tab_id()))
         .unwrap_or_else(|| vec![Line::from("No terminal output yet.")]);
     let (term_style, term_border_type) =
-        focused_border(app.focus == crate::app::Focus::WsTerminal);
+        pane_border_style(app.focus == crate::app::Focus::WsTerminal, attention, app.flash_on);
+    let term_title = build_terminal_title_line(attention, app.flash_on);
     frame.render_widget(Clear, l.terminal_pane);
     frame.render_widget(
         Paragraph::new(terminal_lines).block(
             Block::default()
-                .title("Terminal")
+                .title(term_title)
                 .borders(Borders::ALL)
                 .border_style(term_style)
                 .border_type(term_border_type),
@@ -689,4 +788,98 @@ pub fn terminal_content_rect(area: Rect, focus: crate::app::Focus) -> Rect {
         pane.width.saturating_sub(2),
         pane.height.saturating_sub(2),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- pane_border_style tests ---
+
+    #[test]
+    fn pane_border_no_attention_unfocused() {
+        let (style, border_type) = pane_border_style(false, AttentionLevel::None, false);
+        assert_eq!(border_type, BorderType::Plain);
+        assert_eq!(style.fg, Some(Color::White));
+        assert!(style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn pane_border_no_attention_focused() {
+        let (style, border_type) = pane_border_style(true, AttentionLevel::None, false);
+        assert_eq!(border_type, BorderType::Thick);
+        assert_eq!(style.fg, Some(Color::LightBlue));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn pane_border_needs_input_flash_on() {
+        let (style, border_type) = pane_border_style(true, AttentionLevel::NeedsInput, true);
+        assert_eq!(border_type, BorderType::Thick);
+        assert_eq!(style.fg, Some(ORANGE));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn pane_border_needs_input_flash_off() {
+        // flash_off reverts to focused style
+        let (style, border_type) = pane_border_style(true, AttentionLevel::NeedsInput, false);
+        assert_eq!(border_type, BorderType::Thick);
+        assert_eq!(style.fg, Some(Color::LightBlue));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn pane_border_error_flash_on() {
+        let (style, border_type) = pane_border_style(false, AttentionLevel::Error, true);
+        assert_eq!(border_type, BorderType::Thick);
+        assert_eq!(style.fg, Some(Color::Red));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn pane_border_error_flash_off_unfocused() {
+        let (style, border_type) = pane_border_style(false, AttentionLevel::Error, false);
+        assert_eq!(border_type, BorderType::Plain);
+        assert_eq!(style.fg, Some(Color::White));
+        assert!(style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn pane_border_notice_no_flash() {
+        // Notice level does not trigger attention flash
+        let (style, border_type) = pane_border_style(true, AttentionLevel::Notice, true);
+        assert_eq!(border_type, BorderType::Thick);
+        assert_eq!(style.fg, Some(Color::LightBlue));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    // --- build_terminal_title_line tests ---
+
+    #[test]
+    fn terminal_title_no_attention() {
+        let line = build_terminal_title_line(AttentionLevel::None, false);
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].content, "Terminal");
+    }
+
+    #[test]
+    fn terminal_title_needs_input() {
+        let line = build_terminal_title_line(AttentionLevel::NeedsInput, true);
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[0].content, "Terminal ");
+        assert_eq!(line.spans[1].content, "⚠ input");
+        assert_eq!(line.spans[1].style.fg, Some(ORANGE));
+        assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn terminal_title_error() {
+        let line = build_terminal_title_line(AttentionLevel::Error, true);
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[0].content, "Terminal ");
+        assert_eq!(line.spans[1].content, "✖ error");
+        assert_eq!(line.spans[1].style.fg, Some(Color::Red));
+        assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+    }
 }
