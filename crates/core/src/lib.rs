@@ -637,8 +637,8 @@ struct PersistedWorkspace {
 
 fn persist_file() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    let base = PathBuf::from(home).join(".config/multiws");
-    let file = if let Ok(session) = std::env::var("MULTIWS_SESSION_NAME") {
+    let base = PathBuf::from(home).join(".config/anvl");
+    let file = if let Ok(session) = std::env::var("ANVL_SESSION_NAME") {
         let safe = sanitize_session_name(&session);
         format!("workspaces.{safe}.json")
     } else {

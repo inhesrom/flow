@@ -20,7 +20,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &TuiApp) {
     render_modals(frame, area, app);
 }
 
-/// Renders the rounded dashboard box with colored status badges.
+/// Renders the rounded dashboard box with anvil ASCII art and colored status badges.
 fn render_dashboard(frame: &mut Frame, area: Rect, app: &TuiApp) {
     let needs_input = app
         .workspaces
@@ -35,18 +35,30 @@ fn render_dashboard(frame: &mut Frame, area: Rect, app: &TuiApp) {
     let dirty = app.workspaces.iter().map(|w| w.dirty_files).sum::<usize>();
     let running_agents = app.workspaces.iter().filter(|w| w.agent_running).count();
 
-    let mut spans = Vec::new();
-    spans.extend(dashboard_badge(needs_input, "\u{26A0}", "input", ORANGE));
-    spans.extend(dashboard_badge(errors, "\u{2716}", "error", Color::Red));
-    spans.extend(dashboard_badge(dirty, "\u{25C8}", "changes", Color::Yellow));
-    spans.extend(dashboard_badge(running_agents, "\u{25CF}", "agents", Color::Green));
+    let mut badge_spans = Vec::new();
+    badge_spans.extend(dashboard_badge(needs_input, "\u{26A0}", "input", ORANGE));
+    badge_spans.extend(dashboard_badge(errors, "\u{2716}", "error", Color::Red));
+    badge_spans.extend(dashboard_badge(dirty, "\u{25C8}", "changes", Color::Yellow));
+    badge_spans.extend(dashboard_badge(running_agents, "\u{25CF}", "agents", Color::Green));
 
-    let dashboard = Paragraph::new(Line::from(spans)).block(
+    let art_style = Style::default().fg(Color::Cyan);
+
+    let mut badge_line_spans = vec![
+        Span::styled(" \u{2588}\u{2580}\u{2588} \u{2588}\u{2584} \u{2588} \u{2588}   \u{2588} \u{2588}     ", art_style),
+    ];
+    badge_line_spans.extend(badge_spans);
+
+    let art_lines: Vec<Line> = vec![
+        Line::from(Span::styled(" \u{2584}\u{2580}\u{2588} \u{2588}\u{2584} \u{2588} \u{2588}   \u{2588} \u{2588}", art_style)),
+        Line::from(badge_line_spans),
+    ];
+
+    let dashboard = Paragraph::new(art_lines).block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .title_top(Line::from(Span::styled(
-                " \u{25C8} flow ",
+                " anvl ",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -208,7 +220,7 @@ fn home_chunks(area: Rect) -> Vec<Rect> {
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(5),
             Constraint::Min(5),
             Constraint::Length(2),
         ])

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -58,6 +58,9 @@ pub struct TuiApp {
     pub commit_input: Option<String>,
     pub create_branch_input: Option<String>,
     pub settings: Settings,
+    /// Workspace IDs with an in-flight git network operation (pull/push/fetch).
+    /// Set on command dispatch, cleared when `GitActionResult` arrives.
+    pub git_op_in_progress: HashSet<WorkspaceId>,
     pub settings_open: bool,
     pub settings_selected: usize,
 }
@@ -96,6 +99,7 @@ impl Default for TuiApp {
             git_action_message: None,
             commit_input: None,
             create_branch_input: None,
+            git_op_in_progress: HashSet::new(),
             settings: load_settings(),
             settings_open: false,
             settings_selected: 0,
@@ -554,6 +558,18 @@ impl TuiApp {
         }
     }
 
+    pub fn begin_git_op(&mut self, id: WorkspaceId) {
+        self.git_op_in_progress.insert(id);
+    }
+
+    pub fn finish_git_op(&mut self, id: WorkspaceId) {
+        self.git_op_in_progress.remove(&id);
+    }
+
+    pub fn is_git_op_in_progress(&self, id: WorkspaceId) -> bool {
+        self.git_op_in_progress.contains(&id)
+    }
+
     pub fn begin_create_branch(&mut self) {
         self.create_branch_input = Some(String::new());
     }
@@ -919,7 +935,7 @@ fn tabs_persist_path() -> Option<PathBuf> {
     } else {
         return None;
     };
-    Some(base.join("multiws").join("tui_tabs.json"))
+    Some(base.join("anvl").join("tui_tabs.json"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -948,7 +964,7 @@ fn settings_persist_path() -> Option<PathBuf> {
     } else {
         return None;
     };
-    Some(base.join("multiws").join("settings.json"))
+    Some(base.join("anvl").join("settings.json"))
 }
 
 fn load_settings() -> Settings {

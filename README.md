@@ -1,4 +1,4 @@
-# Flow
+# Anvl
 
 A terminal-based multi-workspace manager built with Rust.
 
@@ -14,7 +14,7 @@ A terminal-based multi-workspace manager built with Rust.
 
 ## Architecture
 
-Flow is organized as a Cargo workspace with four crates and a web frontend:
+Anvl is organized as a Cargo workspace with four crates and a web frontend:
 
 | Crate | Description |
 |---|---|
@@ -42,18 +42,18 @@ cargo build --release
 ```sh
 cargo run
 # or
-./target/release/flow
+./target/release/anvl
 ```
 
 ## Usage
 
 ```
-flow                    Local mode (no session)
-flow -s <name>          Create and start a named session
-flow -a <name>          Attach to an existing session
-flow -l                 List sessions
-flow -r <name>          Remove a session
-flow -d                 Detach (use with -s or -a)
+anvl                    Local mode (no session)
+anvl -s <name>          Create and start a named session
+anvl -a <name>          Attach to an existing session
+anvl -l                 List sessions
+anvl -r <name>          Remove a session
+anvl -d                 Detach (use with -s or -a)
 ```
 
 ## Key Bindings
@@ -98,13 +98,13 @@ flow -d                 Detach (use with -s or -a)
 
 | Variable | Description | Default |
 |---|---|---|
-| `MULTIWS_WEB_PORT` | Embedded web server port | `3001` |
-| `MULTIWS_DISABLE_EMBEDDED_WEB` | Disable the embedded web server if set | — |
+| `ANVL_WEB_PORT` | Embedded web server port | `3001` |
+| `ANVL_DISABLE_EMBEDDED_WEB` | Disable the embedded web server if set | — |
 | `SHELL` | Shell used for terminal sessions | `zsh` |
 
 ### Config Paths
 
-Flow stores configuration under `~/.config/multiws/` (respects `XDG_CONFIG_HOME`):
+Anvl stores configuration under `~/.config/anvl/` (respects `XDG_CONFIG_HOME`):
 
 - `sessions.json` — session registry
 - `workspaces.json` — default workspace persistence

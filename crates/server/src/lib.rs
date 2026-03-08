@@ -11,7 +11,7 @@ use axum::{
     routing::get,
     Router,
 };
-use multiws_core::CoreHandle;
+use anvl_core::CoreHandle;
 use state_bridge::ServerState;
 
 async fn index() -> impl IntoResponse {

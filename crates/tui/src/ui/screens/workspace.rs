@@ -199,6 +199,10 @@ pub fn build_terminal_title_line(attention: AttentionLevel, flash_on: bool) -> L
     }
 }
 
+fn spinner_frame(flash_on: bool) -> &'static str {
+    if flash_on { "⠋" } else { "⠙" }
+}
+
 pub fn render(frame: &mut Frame, area: Rect, app: &TuiApp) {
     let l = layout(area, app.focus);
 
@@ -391,6 +395,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &TuiApp) {
                     Style::default()
                 };
                 spans.push(Span::styled(b.name.clone(), name_style));
+                if b.is_head && ws_id.map(|id| app.is_git_op_in_progress(id)).unwrap_or(false) {
+                    spans.push(Span::styled(
+                        format!(" {}", spinner_frame(app.flash_on)),
+                        Style::default().fg(Color::Cyan),
+                    ));
+                }
                 // Ahead/behind indicators
                 match (b.ahead, b.behind) {
                     (Some(a), Some(b_count)) if a == 0 && b_count == 0 => {

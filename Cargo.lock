@@ -9,6 +9,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "anvl_core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "futures",
+ "parking_lot",
+ "portable-pty",
+ "protocol",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -719,23 +736,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "multiws_core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "futures",
- "parking_lot",
- "portable-pty",
- "protocol",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "nix"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1080,10 +1080,10 @@ dependencies = [
 name = "server"
 version = "0.1.0"
 dependencies = [
+ "anvl_core",
  "anyhow",
  "axum",
  "base64",
- "multiws_core",
  "protocol",
  "serde",
  "serde_json",
@@ -1405,11 +1405,11 @@ dependencies = [
 name = "tui"
 version = "0.1.0"
 dependencies = [
+ "anvl_core",
  "anyhow",
  "base64",
  "crossterm",
  "futures",
- "multiws_core",
  "protocol",
  "ratatui",
  "serde",

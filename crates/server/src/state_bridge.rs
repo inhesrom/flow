@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use multiws_core::CoreHandle;
+use anvl_core::CoreHandle;
 use protocol::{Event, GitState, TerminalKind, WorkspaceId, WorkspaceSummary};
 use tokio::sync::RwLock;
 

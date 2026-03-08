@@ -20,7 +20,7 @@ use crossterm::{
     ExecutableCommand,
 };
 use futures::{SinkExt, StreamExt};
-use multiws_core::{spawn_core, CoreHandle};
+use anvl_core::{spawn_core, CoreHandle};
 use protocol::{AttentionLevel, Command, Event as CoreEvent, Route, TerminalKind};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use serde::{Deserialize, Serialize};
@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
         LaunchMode::AttachSession { name } => {
             let entry = get_session(&name)?.ok_or_else(|| {
                 anyhow!(
-                    "session '{}' not found. create it with: flow -s {}",
+                    "session '{}' not found. create it with: anvl -s {}",
                     name,
                     name
                 )
@@ -108,15 +108,15 @@ async fn main() -> Result<()> {
         LaunchMode::Local => {
             if cli.detach {
                 return Err(anyhow!(
-                    "--detach requires a named session: use `flow -s <name> -d` or `flow -a <name> -d`"
+                    "--detach requires a named session: use `anvl -s <name> -d` or `anvl -a <name> -d`"
                 ));
             }
             let (backend, core) = build_local_backend();
-            let web_port = std::env::var("MULTIWS_WEB_PORT")
+            let web_port = std::env::var("ANVL_WEB_PORT")
                 .ok()
                 .and_then(|v| v.parse::<u16>().ok())
                 .unwrap_or(3001);
-            if std::env::var("MULTIWS_DISABLE_EMBEDDED_WEB").is_err() {
+            if std::env::var("ANVL_DISABLE_EMBEDDED_WEB").is_err() {
                 let core_for_web = core.clone();
                 tokio::spawn(async move {
                     let _ = server::run_server_with_core(core_for_web, web_port).await;
@@ -221,9 +221,9 @@ fn parse_cli(args: Vec<String>) -> Result<Cli> {
 
 async fn run_daemon(name: Option<String>, port: u16) -> Result<()> {
     if let Some(session_name) = name {
-        std::env::set_var("MULTIWS_SESSION_NAME", session_name);
+        std::env::set_var("ANVL_SESSION_NAME", session_name);
     } else {
-        std::env::remove_var("MULTIWS_SESSION_NAME");
+        std::env::remove_var("ANVL_SESSION_NAME");
     }
     let core = spawn_core();
     server::run_server_with_core(core, port).await
@@ -812,16 +812,19 @@ async fn run_tui(mut backend: Backend) -> Result<()> {
                                     if matches!(app.focus, app::Focus::WsBranches) =>
                                 {
                                     let _ = backend.cmd_tx.send(Command::GitPull { id }).await;
+                                    app.begin_git_op(id);
                                 }
                                 KeyCode::Char('f')
                                     if matches!(app.focus, app::Focus::WsBranches) =>
                                 {
                                     let _ = backend.cmd_tx.send(Command::GitFetch { id }).await;
+                                    app.begin_git_op(id);
                                 }
                                 KeyCode::Char('P')
                                     if matches!(app.focus, app::Focus::WsBranches) =>
                                 {
                                     let _ = backend.cmd_tx.send(Command::GitPush { id }).await;
+                                    app.begin_git_op(id);
                                 }
                                 KeyCode::Char('e') if matches!(app.focus, app::Focus::WsHeader) => {
                                     app.begin_rename_workspace();
@@ -998,11 +1001,12 @@ fn apply_event(app: &mut TuiApp, evt: CoreEvent) {
             app.append_terminal_bytes(id, &tid, b"[terminal started]\r\n");
         }
         CoreEvent::GitActionResult {
-            id: _,
+            id,
             action: _,
             success: _,
             message,
         } => {
+            app.finish_git_op(id);
             app.git_action_message = Some((message, std::time::Instant::now()));
         }
         CoreEvent::WorkspaceAttentionChanged { id, level } => {
@@ -1439,7 +1443,7 @@ fn session_registry_path() -> Option<PathBuf> {
     } else {
         return None;
     };
-    Some(base.join("multiws").join("sessions.json"))
+    Some(base.join("anvl").join("sessions.json"))
 }
 
 fn session_workspaces_persist_path(name: &str) -> Option<PathBuf> {
@@ -1448,7 +1452,7 @@ fn session_workspaces_persist_path(name: &str) -> Option<PathBuf> {
     Some(
         PathBuf::from(home)
             .join(".config")
-            .join("multiws")
+            .join("anvl")
             .join(format!("workspaces.{safe}.json")),
     )
 }

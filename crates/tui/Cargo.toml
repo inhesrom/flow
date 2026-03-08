@@ -4,12 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "flow"
+name = "anvl"
 path = "src/main.rs"
 
 [dependencies]
 protocol = { path = "../protocol" }
-multiws_core = { path = "../core" }
+anvl_core = { path = "../core" }
 server = { path = "../server" }
 anyhow = "1"
 base64 = "0.22"
