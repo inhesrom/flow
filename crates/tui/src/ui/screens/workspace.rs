@@ -136,8 +136,23 @@ pub fn pane_border_style(
 }
 
 /// Builds the title `Line` for the terminal pane, with an optional attention badge.
-pub fn build_terminal_title_line(attention: AttentionLevel, flash_on: bool) -> Line<'static> {
-    match attention {
+pub fn build_terminal_title_line(
+    attention: AttentionLevel,
+    flash_on: bool,
+    passthrough: bool,
+) -> Line<'static> {
+    let raw_badge = if passthrough {
+        Some(Span::styled(
+            " [passthrough]",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        None
+    };
+
+    let mut spans = match attention {
         AttentionLevel::NeedsInput => {
             let badge_style = if flash_on {
                 Style::default()
@@ -146,10 +161,10 @@ pub fn build_terminal_title_line(attention: AttentionLevel, flash_on: bool) -> L
             } else {
                 Style::default().fg(ORANGE)
             };
-            Line::from(vec![
+            vec![
                 Span::raw("Terminal "),
                 Span::styled("⚠ input", badge_style),
-            ])
+            ]
         }
         AttentionLevel::Error => {
             let badge_style = if flash_on {
@@ -159,13 +174,17 @@ pub fn build_terminal_title_line(attention: AttentionLevel, flash_on: bool) -> L
             } else {
                 Style::default().fg(Color::Red)
             };
-            Line::from(vec![
+            vec![
                 Span::raw("Terminal "),
                 Span::styled("✖ error", badge_style),
-            ])
+            ]
         }
-        _ => Line::from("Terminal"),
+        _ => vec![Span::raw("Terminal")],
+    };
+    if let Some(badge) = raw_badge {
+        spans.push(badge);
     }
+    Line::from(spans)
 }
 
 fn spinner_frame(flash_on: bool) -> &'static str {
@@ -611,7 +630,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &TuiApp) {
         .unwrap_or_else(|| vec![Line::from("No terminal output yet.")]);
     let (term_style, term_border_type) =
         pane_border_style(app.focus == crate::app::Focus::WsTerminal, attention, app.flash_on);
-    let term_title = build_terminal_title_line(attention, app.flash_on);
+    let term_title = build_terminal_title_line(attention, app.flash_on, app.terminal_passthrough);
     frame.render_widget(Clear, l.terminal_pane);
     frame.render_widget(
         Paragraph::new(terminal_lines).block(
@@ -859,14 +878,14 @@ mod tests {
 
     #[test]
     fn terminal_title_no_attention() {
-        let line = build_terminal_title_line(AttentionLevel::None, false);
+        let line = build_terminal_title_line(AttentionLevel::None, false, false);
         assert_eq!(line.spans.len(), 1);
         assert_eq!(line.spans[0].content, "Terminal");
     }
 
     #[test]
     fn terminal_title_needs_input() {
-        let line = build_terminal_title_line(AttentionLevel::NeedsInput, true);
+        let line = build_terminal_title_line(AttentionLevel::NeedsInput, true, false);
         assert_eq!(line.spans.len(), 2);
         assert_eq!(line.spans[0].content, "Terminal ");
         assert_eq!(line.spans[1].content, "⚠ input");
@@ -876,7 +895,7 @@ mod tests {
 
     #[test]
     fn terminal_title_error() {
-        let line = build_terminal_title_line(AttentionLevel::Error, true);
+        let line = build_terminal_title_line(AttentionLevel::Error, true, false);
         assert_eq!(line.spans.len(), 2);
         assert_eq!(line.spans[0].content, "Terminal ");
         assert_eq!(line.spans[1].content, "✖ error");

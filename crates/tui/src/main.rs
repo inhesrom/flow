@@ -726,6 +726,35 @@ async fn run_tui(mut backend: Backend) -> Result<()> {
                                 continue;
                             }
 
+                            // Ctrl+G toggles terminal passthrough mode.
+                            if key.code == KeyCode::Char('g')
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                                && matches!(app.focus, app::Focus::WsTerminal)
+                            {
+                                app.terminal_passthrough = !app.terminal_passthrough;
+                                continue;
+                            }
+
+                            // In passthrough mode, forward everything (including Esc/Tab)
+                            // to the terminal.
+                            if app.terminal_passthrough
+                                && matches!(app.focus, app::Focus::WsTerminal)
+                            {
+                                if let Some(bytes) = key_to_terminal_bytes(key) {
+                                    let _ = backend
+                                        .cmd_tx
+                                        .send(Command::SendTerminalInput {
+                                            id,
+                                            kind: app.active_tab_kind(),
+                                            tab_id: Some(app.active_tab_id()),
+                                            data_b64: base64::engine::general_purpose::STANDARD
+                                                .encode(bytes),
+                                        })
+                                        .await;
+                                }
+                                continue;
+                            }
+
                             if key.code == KeyCode::Esc {
                                 if matches!(app.focus, app::Focus::WsTerminal) {
                                     app.focus = app::Focus::WsTerminalTabs;
@@ -1160,6 +1189,7 @@ fn key_to_terminal_bytes(key: KeyEvent) -> Option<Vec<u8>> {
                 Some(c.to_string().into_bytes())
             }
         }
+        KeyCode::Esc => Some(vec![0x1b]),
         KeyCode::Enter => Some(vec![b'\r']),
         KeyCode::Backspace => Some(vec![0x7f]),
         KeyCode::Tab => Some(vec![b'\t']),
