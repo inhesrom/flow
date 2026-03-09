@@ -4,6 +4,13 @@ use uuid::Uuid;
 pub type WorkspaceId = Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshTarget {
+    pub host: String,
+    pub user: Option<String>,
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Route {
     Home,
     Workspace { id: WorkspaceId },
@@ -36,6 +43,8 @@ pub struct WorkspaceSummary {
     pub agent_running: bool,
     pub shell_running: bool,
     pub last_activity_unix_ms: u64,
+    #[serde(default)]
+    pub ssh_host: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +93,8 @@ pub enum Command {
     AddWorkspace {
         name: String,
         path: String,
+        #[serde(default)]
+        ssh: Option<SshTarget>,
     },
     RemoveWorkspace {
         id: WorkspaceId,

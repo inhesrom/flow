@@ -1,12 +1,15 @@
 use anyhow::{bail, Result};
 use parking_lot::Mutex;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use protocol::SshTarget;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use tokio::sync::mpsc;
+
+use super::ssh;
 
 #[derive(Default)]
 pub struct WorkspaceTerminals {
@@ -60,8 +63,19 @@ impl TerminalSession {
 pub async fn start_terminal(
     cwd: PathBuf,
     cmd: Vec<String>,
+    ssh_target: Option<&SshTarget>,
 ) -> Result<(TerminalSession, mpsc::Receiver<TerminalOutput>)> {
-    let Some(program) = cmd.first() else {
+    let effective_cmd = if let Some(target) = ssh_target {
+        if cmd.is_empty() || is_default_shell_cmd(&cmd) {
+            ssh::ssh_args_for_terminal(target, &cwd)
+        } else {
+            cmd
+        }
+    } else {
+        cmd
+    };
+
+    let Some(program) = effective_cmd.first() else {
         bail!("terminal command cannot be empty");
     };
 
@@ -74,10 +88,12 @@ pub async fn start_terminal(
     })?;
 
     let mut builder = CommandBuilder::new(program);
-    for arg in cmd.iter().skip(1) {
+    for arg in effective_cmd.iter().skip(1) {
         builder.arg(arg);
     }
-    builder.cwd(cwd);
+    if ssh_target.is_none() {
+        builder.cwd(cwd);
+    }
 
     let child = pty_pair.slave.spawn_command(builder)?;
     let mut reader = pty_pair.master.try_clone_reader()?;
@@ -117,4 +133,21 @@ pub async fn start_terminal(
         },
         rx,
     ))
+}
+
+/// Returns true if the command looks like a default local shell invocation.
+fn is_default_shell_cmd(cmd: &[String]) -> bool {
+    if cmd.is_empty() {
+        return true;
+    }
+    let prog = &cmd[0];
+    let is_shell = prog.ends_with("/bash")
+        || prog.ends_with("/zsh")
+        || prog.ends_with("/sh")
+        || prog.ends_with("/fish")
+        || prog == "bash"
+        || prog == "zsh"
+        || prog == "sh"
+        || prog == "fish";
+    is_shell && cmd.iter().skip(1).all(|a| a.starts_with('-'))
 }

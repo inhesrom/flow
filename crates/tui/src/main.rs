@@ -902,6 +902,80 @@ async fn run_tui(mut backend: Backend) -> Result<()> {
                                     }
                                     _ => {}
                                 }
+                            } else if app.ssh_history_picker.is_some() {
+                                match key.code {
+                                    KeyCode::Char('j') | KeyCode::Down => {
+                                        if let Some(ref mut picker) = app.ssh_history_picker {
+                                            let len = app.ssh_history.len();
+                                            if len > 0 {
+                                                picker.selected = (picker.selected + 1) % len;
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Char('k') | KeyCode::Up => {
+                                        if let Some(ref mut picker) = app.ssh_history_picker {
+                                            let len = app.ssh_history.len();
+                                            if len > 0 {
+                                                picker.selected = (picker.selected + len - 1) % len;
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Enter => app.select_ssh_history_entry(),
+                                    KeyCode::Char('n') => app.begin_new_ssh_from_picker(),
+                                    KeyCode::Esc => app.cancel_ssh_history_picker(),
+                                    _ => {}
+                                }
+                            } else if app.is_adding_ssh_workspace() {
+                                match key.code {
+                                    KeyCode::Esc => app.cancel_ssh_workspace(),
+                                    KeyCode::Tab | KeyCode::BackTab => {
+                                        if let Some(ref mut input) = app.ssh_workspace_input {
+                                            input.cycle_field();
+                                        }
+                                    }
+                                    KeyCode::Enter => {
+                                        // Record history before taking the request
+                                        if let Some(ref input) = app.ssh_workspace_input {
+                                            let host = input.host.trim().to_string();
+                                            let path = input.path.trim().to_string();
+                                            if !host.is_empty() && !path.is_empty() {
+                                                let user = if input.user.trim().is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(input.user.trim().to_string())
+                                                };
+                                                app.record_ssh_history(app::SshHistoryEntry {
+                                                    host,
+                                                    user,
+                                                    path,
+                                                });
+                                            }
+                                        }
+                                        if let Some((name, path, target)) =
+                                            app.take_ssh_workspace_request()
+                                        {
+                                            let _ = backend
+                                                .cmd_tx
+                                                .send(Command::AddWorkspace {
+                                                    name,
+                                                    path,
+                                                    ssh: Some(target),
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                    KeyCode::Char(c) => {
+                                        if let Some(ref mut input) = app.ssh_workspace_input {
+                                            input.active_input_mut().push(c);
+                                        }
+                                    }
+                                    KeyCode::Backspace => {
+                                        if let Some(ref mut input) = app.ssh_workspace_input {
+                                            input.active_input_mut().pop();
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             } else if app.is_adding_workspace() {
                                 let editing = app.dir_browser.as_ref().map_or(false, |b| b.editing_path);
                                 if editing {
@@ -948,7 +1022,7 @@ async fn run_tui(mut backend: Backend) -> Result<()> {
                                             {
                                                 let _ = backend
                                                     .cmd_tx
-                                                    .send(Command::AddWorkspace { name, path })
+                                                    .send(Command::AddWorkspace { name, path, ssh: None })
                                                     .await;
                                             }
                                         }
@@ -983,7 +1057,7 @@ async fn run_tui(mut backend: Backend) -> Result<()> {
                                                 {
                                                     let _ = backend
                                                         .cmd_tx
-                                                        .send(Command::AddWorkspace { name, path })
+                                                        .send(Command::AddWorkspace { name, path, ssh: None })
                                                         .await;
                                                 }
                                             }
@@ -1057,6 +1131,7 @@ async fn run_tui(mut backend: Backend) -> Result<()> {
                                             .to_string();
                                         app.begin_add_workspace(cwd);
                                     }
+                                    KeyCode::Char('R') => app.begin_add_ssh_workspace(),
                                     KeyCode::Char('D') => app.begin_delete_workspace(),
                                     KeyCode::Char('e') => app.begin_rename_workspace_home(),
                                     KeyCode::Char('S') => app.open_settings(),

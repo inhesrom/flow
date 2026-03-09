@@ -192,6 +192,126 @@ fn render_modals(frame: &mut Frame, area: Rect, app: &TuiApp) {
         );
     }
 
+    if let Some(ref picker) = app.ssh_history_picker {
+        let entry_count = app.ssh_history.len();
+        let modal_height = (entry_count as u16 + 5).min(20);
+        let modal = centered_rect(area, 60, modal_height);
+        frame.render_widget(Clear, modal);
+
+        let outer_block = Block::default()
+            .title(" Recent SSH Workspaces ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner = outer_block.inner(modal);
+        frame.render_widget(outer_block, modal);
+
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(2)])
+            .split(inner);
+
+        let items: Vec<ListItem> = app
+            .ssh_history
+            .iter()
+            .map(|entry| {
+                let label = if let Some(ref user) = entry.user {
+                    format!("  {}@{}:{}", user, entry.host, entry.path)
+                } else {
+                    format!("  {}:{}", entry.host, entry.path)
+                };
+                ListItem::new(label)
+            })
+            .collect();
+
+        let list = List::new(items)
+            .highlight_symbol("> ")
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            );
+        let mut list_state = ListState::default();
+        list_state.select(Some(picker.selected));
+        frame.render_stateful_widget(list, sections[0], &mut list_state);
+
+        let key_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+        let desc_style = Style::default().fg(Color::DarkGray);
+        let hints = Line::from(vec![
+            Span::styled("j/k", key_style),
+            Span::styled(" nav  ", desc_style),
+            Span::styled("Enter", key_style),
+            Span::styled(" select  ", desc_style),
+            Span::styled("n", key_style),
+            Span::styled(" new  ", desc_style),
+            Span::styled("Esc", key_style),
+            Span::styled(" cancel", desc_style),
+        ]);
+        frame.render_widget(Paragraph::new(vec![Line::from(""), hints]), sections[1]);
+    }
+
+    if let Some(ref ssh_input) = app.ssh_workspace_input {
+        let modal = centered_rect(area, 60, 14);
+        frame.render_widget(Clear, modal);
+
+        let outer_block = Block::default()
+            .title(" Add SSH Workspace ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner = outer_block.inner(modal);
+        frame.render_widget(outer_block, modal);
+
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Min(1),
+            ])
+            .split(inner);
+
+        let fields = [
+            ("Host", &ssh_input.host, crate::app::SshField::Host),
+            ("User", &ssh_input.user, crate::app::SshField::User),
+            ("Path", &ssh_input.path, crate::app::SshField::Path),
+        ];
+
+        for (i, (label, value, field)) in fields.iter().enumerate() {
+            let is_focused = ssh_input.focused_field == *field;
+            let border_style = if is_focused {
+                Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let display = if is_focused {
+                format!("{}_", value)
+            } else {
+                value.to_string()
+            };
+            let widget = Paragraph::new(display).block(
+                Block::default()
+                    .title(format!(" {} ", label))
+                    .borders(Borders::ALL)
+                    .border_style(border_style),
+            );
+            frame.render_widget(widget, sections[i]);
+        }
+
+        let key_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+        let desc_style = Style::default().fg(Color::DarkGray);
+        let hints = Line::from(vec![
+            Span::styled("Tab", key_style),
+            Span::styled(" next field  ", desc_style),
+            Span::styled("Enter", key_style),
+            Span::styled(" add  ", desc_style),
+            Span::styled("Esc", key_style),
+            Span::styled(" cancel", desc_style),
+        ]);
+        frame.render_widget(Paragraph::new(vec![hints]), sections[3]);
+    }
+
     if let Some(id) = app.pending_delete_workspace {
         let name = app
             .workspaces

@@ -12,14 +12,22 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
-use protocol::{AttentionLevel, Command, Event, WorkspaceSummary};
+use protocol::{AttentionLevel, Command, Event, GitState, SshTarget, WorkspaceSummary};
 use state::{AppState, Workspace};
 use uuid::Uuid;
+
+/// Result of a background git refresh for one workspace.
+struct GitRefreshResult {
+    id: Uuid,
+    result: Result<GitState, anyhow::Error>,
+}
+
 use workspace::attention::AttentionDetector;
 use workspace::git::{
     checkout_branch, checkout_remote_branch, commit, create_branch, diff_commit, diff_file,
     git_fetch, git_pull, git_push, refresh_git, stage_all, stage_file, unstage_all, unstage_file,
 };
+use workspace::ssh;
 use workspace::terminal::{start_terminal, TerminalOutput};
 
 #[derive(Clone)]
@@ -41,6 +49,8 @@ pub fn spawn_core() -> CoreHandle {
             items: workspace_summaries(&state),
         });
         let mut git_tick = tokio::time::interval(Duration::from_secs(2));
+        let mut git_refresh_in_flight = false;
+        let (git_result_tx, mut git_result_rx) = mpsc::channel::<GitRefreshResult>(64);
 
         loop {
             tokio::select! {
@@ -48,14 +58,26 @@ pub fn spawn_core() -> CoreHandle {
                     let Some(cmd) = maybe_cmd else { break; };
                     match cmd {
                 Command::SetRoute(route) => state.route = route,
-                Command::AddWorkspace { name, path } => {
+                Command::AddWorkspace { name, path, ssh } => {
                     let id = Uuid::new_v4();
-                    let repo_path = std::path::PathBuf::from(path);
-                    let initial_git = refresh_git(&repo_path).await.unwrap_or_default();
+                    let repo_path = std::path::PathBuf::from(&path);
+
+                    // Validate SSH connection if applicable
+                    if let Some(ref target) = ssh {
+                        if let Err(e) = ssh::validate_ssh_connection(target, &repo_path).await {
+                            let _ = evt_tx_task.send(Event::Error {
+                                message: format!("SSH workspace creation failed: {e}"),
+                            });
+                            continue;
+                        }
+                    }
+
+                    let initial_git = refresh_git(&repo_path, ssh.as_ref()).await.unwrap_or_default();
                     let ws = Workspace {
                         id,
                         name,
                         path: repo_path,
+                        ssh,
                         git: initial_git.clone(),
                         attention: AttentionLevel::None,
                         terminals: Default::default(),
@@ -94,8 +116,10 @@ pub fn spawn_core() -> CoreHandle {
                     }
                 }
                 Command::RefreshGit { id } => {
-                    if let Some(path) = state.workspaces.get(&id).map(|ws| ws.path.clone()) {
-                        match refresh_git(&path).await {
+                    if let Some(ws) = state.workspaces.get(&id) {
+                        let path = ws.path.clone();
+                        let ssh = ws.ssh.clone();
+                        match refresh_git(&path, ssh.as_ref()).await {
                             Ok(git) => {
                                 if let Some(ws) = state.workspaces.get_mut(&id) {
                                     ws.git = git.clone();
@@ -115,8 +139,10 @@ pub fn spawn_core() -> CoreHandle {
                     }
                 }
                 Command::LoadDiff { id, file } => {
-                    if let Some(path) = state.workspaces.get(&id).map(|ws| ws.path.clone()) {
-                        match diff_file(&path, &file).await {
+                    if let Some(ws) = state.workspaces.get(&id) {
+                        let path = ws.path.clone();
+                        let ssh = ws.ssh.clone();
+                        match diff_file(&path, &file, ssh.as_ref()).await {
                             Ok(diff) => {
                                 let _ = evt_tx_task.send(Event::WorkspaceDiffUpdated {
                                     id,
@@ -136,8 +162,10 @@ pub fn spawn_core() -> CoreHandle {
                     }
                 }
                 Command::LoadCommitDiff { id, hash } => {
-                    if let Some(path) = state.workspaces.get(&id).map(|ws| ws.path.clone()) {
-                        match diff_commit(&path, &hash).await {
+                    if let Some(ws) = state.workspaces.get(&id) {
+                        let path = ws.path.clone();
+                        let ssh = ws.ssh.clone();
+                        match diff_commit(&path, &hash, ssh.as_ref()).await {
                             Ok(diff) => {
                                 let _ = evt_tx_task.send(Event::WorkspaceDiffUpdated {
                                     id,
@@ -157,165 +185,187 @@ pub fn spawn_core() -> CoreHandle {
                     }
                 }
                 Command::GitStageFile { id, file } => {
-                    if let Some(path) = state.workspaces.get(&id).map(|ws| ws.path.clone()) {
-                        let (success, message) = match stage_file(&path, &file).await {
+                    if let Some(ws) = state.workspaces.get(&id) {
+                        let path = ws.path.clone();
+                        let ssh = ws.ssh.clone();
+                        let (success, message) = match stage_file(&path, &file, ssh.as_ref()).await {
                             Ok(()) => (true, format!("Staged {file}")),
                             Err(e) => (false, e.to_string()),
                         };
                         let _ = evt_tx_task.send(Event::GitActionResult {
                             id, action: "stage".to_string(), success, message,
                         });
-                        if let Ok(git) = refresh_git(&path).await {
+                        if let Ok(git) = refresh_git(&path, ssh.as_ref()).await {
                             if let Some(ws) = state.workspaces.get_mut(&id) { ws.git = git.clone(); }
                             let _ = evt_tx_task.send(Event::WorkspaceGitUpdated { id, git });
                         }
                     }
                 }
                 Command::GitUnstageFile { id, file } => {
-                    if let Some(path) = state.workspaces.get(&id).map(|ws| ws.path.clone()) {
-                        let (success, message) = match unstage_file(&path, &file).await {
+                    if let Some(ws) = state.workspaces.get(&id) {
+                        let path = ws.path.clone();
+                        let ssh = ws.ssh.clone();
+                        let (success, message) = match unstage_file(&path, &file, ssh.as_ref()).await {
                             Ok(()) => (true, format!("Unstaged {file}")),
                             Err(e) => (false, e.to_string()),
                         };
                         let _ = evt_tx_task.send(Event::GitActionResult {
                             id, action: "unstage".to_string(), success, message,
                         });
-                        if let Ok(git) = refresh_git(&path).await {
+                        if let Ok(git) = refresh_git(&path, ssh.as_ref()).await {
                             if let Some(ws) = state.workspaces.get_mut(&id) { ws.git = git.clone(); }
                             let _ = evt_tx_task.send(Event::WorkspaceGitUpdated { id, git });
                         }
                     }
                 }
                 Command::GitStageAll { id } => {
-                    if let Some(path) = state.workspaces.get(&id).map(|ws| ws.path.clone()) {
-                        let (success, message) = match stage_all(&path).await {
+                    if let Some(ws) = state.workspaces.get(&id) {
+                        let path = ws.path.clone();
+                        let ssh = ws.ssh.clone();
+                        let (success, message) = match stage_all(&path, ssh.as_ref()).await {
                             Ok(()) => (true, "Staged all".to_string()),
                             Err(e) => (false, e.to_string()),
                         };
                         let _ = evt_tx_task.send(Event::GitActionResult {
                             id, action: "stage_all".to_string(), success, message,
                         });
-                        if let Ok(git) = refresh_git(&path).await {
+                        if let Ok(git) = refresh_git(&path, ssh.as_ref()).await {
                             if let Some(ws) = state.workspaces.get_mut(&id) { ws.git = git.clone(); }
                             let _ = evt_tx_task.send(Event::WorkspaceGitUpdated { id, git });
                         }
                     }
                 }
                 Command::GitUnstageAll { id } => {
-                    if let Some(path) = state.workspaces.get(&id).map(|ws| ws.path.clone()) {
-                        let (success, message) = match unstage_all(&path).await {
+                    if let Some(ws) = state.workspaces.get(&id) {
+                        let path = ws.path.clone();
+                        let ssh = ws.ssh.clone();
+                        let (success, message) = match unstage_all(&path, ssh.as_ref()).await {
                             Ok(()) => (true, "Unstaged all".to_string()),
                             Err(e) => (false, e.to_string()),
                         };
                         let _ = evt_tx_task.send(Event::GitActionResult {
                             id, action: "unstage_all".to_string(), success, message,
                         });
-                        if let Ok(git) = refresh_git(&path).await {
+                        if let Ok(git) = refresh_git(&path, ssh.as_ref()).await {
                             if let Some(ws) = state.workspaces.get_mut(&id) { ws.git = git.clone(); }
                             let _ = evt_tx_task.send(Event::WorkspaceGitUpdated { id, git });
                         }
                     }
                 }
                 Command::GitCommit { id, message } => {
-                    if let Some(path) = state.workspaces.get(&id).map(|ws| ws.path.clone()) {
-                        let (success, msg) = match commit(&path, &message).await {
+                    if let Some(ws) = state.workspaces.get(&id) {
+                        let path = ws.path.clone();
+                        let ssh = ws.ssh.clone();
+                        let (success, msg) = match commit(&path, &message, ssh.as_ref()).await {
                             Ok(()) => (true, "Committed".to_string()),
                             Err(e) => (false, e.to_string()),
                         };
                         let _ = evt_tx_task.send(Event::GitActionResult {
                             id, action: "commit".to_string(), success, message: msg,
                         });
-                        if let Ok(git) = refresh_git(&path).await {
+                        if let Ok(git) = refresh_git(&path, ssh.as_ref()).await {
                             if let Some(ws) = state.workspaces.get_mut(&id) { ws.git = git.clone(); }
                             let _ = evt_tx_task.send(Event::WorkspaceGitUpdated { id, git });
                         }
                     }
                 }
                 Command::GitCheckoutBranch { id, branch } => {
-                    if let Some(path) = state.workspaces.get(&id).map(|ws| ws.path.clone()) {
-                        let (success, msg) = match checkout_branch(&path, &branch).await {
+                    if let Some(ws) = state.workspaces.get(&id) {
+                        let path = ws.path.clone();
+                        let ssh = ws.ssh.clone();
+                        let (success, msg) = match checkout_branch(&path, &branch, ssh.as_ref()).await {
                             Ok(()) => (true, format!("Checked out {branch}")),
                             Err(e) => (false, e.to_string()),
                         };
                         let _ = evt_tx_task.send(Event::GitActionResult {
                             id, action: "checkout".to_string(), success, message: msg,
                         });
-                        if let Ok(git) = refresh_git(&path).await {
+                        if let Ok(git) = refresh_git(&path, ssh.as_ref()).await {
                             if let Some(ws) = state.workspaces.get_mut(&id) { ws.git = git.clone(); }
                             let _ = evt_tx_task.send(Event::WorkspaceGitUpdated { id, git });
                         }
                     }
                 }
                 Command::GitCheckoutRemoteBranch { id, remote_branch, local_name } => {
-                    if let Some(path) = state.workspaces.get(&id).map(|ws| ws.path.clone()) {
-                        let (success, msg) = match checkout_remote_branch(&path, &remote_branch, &local_name).await {
+                    if let Some(ws) = state.workspaces.get(&id) {
+                        let path = ws.path.clone();
+                        let ssh = ws.ssh.clone();
+                        let (success, msg) = match checkout_remote_branch(&path, &remote_branch, &local_name, ssh.as_ref()).await {
                             Ok(()) => (true, format!("Created and checked out {local_name} from {remote_branch}")),
                             Err(e) => (false, e.to_string()),
                         };
                         let _ = evt_tx_task.send(Event::GitActionResult {
                             id, action: "checkout".to_string(), success, message: msg,
                         });
-                        if let Ok(git) = refresh_git(&path).await {
+                        if let Ok(git) = refresh_git(&path, ssh.as_ref()).await {
                             if let Some(ws) = state.workspaces.get_mut(&id) { ws.git = git.clone(); }
                             let _ = evt_tx_task.send(Event::WorkspaceGitUpdated { id, git });
                         }
                     }
                 }
                 Command::GitCreateBranch { id, branch } => {
-                    if let Some(path) = state.workspaces.get(&id).map(|ws| ws.path.clone()) {
-                        let (success, msg) = match create_branch(&path, &branch).await {
+                    if let Some(ws) = state.workspaces.get(&id) {
+                        let path = ws.path.clone();
+                        let ssh = ws.ssh.clone();
+                        let (success, msg) = match create_branch(&path, &branch, ssh.as_ref()).await {
                             Ok(()) => (true, format!("Created and checked out {branch}")),
                             Err(e) => (false, e.to_string()),
                         };
                         let _ = evt_tx_task.send(Event::GitActionResult {
                             id, action: "create_branch".to_string(), success, message: msg,
                         });
-                        if let Ok(git) = refresh_git(&path).await {
+                        if let Ok(git) = refresh_git(&path, ssh.as_ref()).await {
                             if let Some(ws) = state.workspaces.get_mut(&id) { ws.git = git.clone(); }
                             let _ = evt_tx_task.send(Event::WorkspaceGitUpdated { id, git });
                         }
                     }
                 }
                 Command::GitPush { id } => {
-                    if let Some(path) = state.workspaces.get(&id).map(|ws| ws.path.clone()) {
-                        let (success, msg) = match git_push(&path).await {
+                    if let Some(ws) = state.workspaces.get(&id) {
+                        let path = ws.path.clone();
+                        let ssh = ws.ssh.clone();
+                        let (success, msg) = match git_push(&path, ssh.as_ref()).await {
                             Ok(()) => (true, "Pushed".to_string()),
                             Err(e) => (false, e.to_string()),
                         };
                         let _ = evt_tx_task.send(Event::GitActionResult {
                             id, action: "push".to_string(), success, message: msg,
                         });
-                        if let Ok(git) = refresh_git(&path).await {
+                        if let Ok(git) = refresh_git(&path, ssh.as_ref()).await {
                             if let Some(ws) = state.workspaces.get_mut(&id) { ws.git = git.clone(); }
                             let _ = evt_tx_task.send(Event::WorkspaceGitUpdated { id, git });
                         }
                     }
                 }
                 Command::GitPull { id } => {
-                    if let Some(path) = state.workspaces.get(&id).map(|ws| ws.path.clone()) {
-                        let (success, msg) = match git_pull(&path).await {
+                    if let Some(ws) = state.workspaces.get(&id) {
+                        let path = ws.path.clone();
+                        let ssh = ws.ssh.clone();
+                        let (success, msg) = match git_pull(&path, ssh.as_ref()).await {
                             Ok(()) => (true, "Pulled".to_string()),
                             Err(e) => (false, e.to_string()),
                         };
                         let _ = evt_tx_task.send(Event::GitActionResult {
                             id, action: "pull".to_string(), success, message: msg,
                         });
-                        if let Ok(git) = refresh_git(&path).await {
+                        if let Ok(git) = refresh_git(&path, ssh.as_ref()).await {
                             if let Some(ws) = state.workspaces.get_mut(&id) { ws.git = git.clone(); }
                             let _ = evt_tx_task.send(Event::WorkspaceGitUpdated { id, git });
                         }
                     }
                 }
                 Command::GitFetch { id } => {
-                    if let Some(path) = state.workspaces.get(&id).map(|ws| ws.path.clone()) {
-                        let (success, msg) = match git_fetch(&path).await {
+                    if let Some(ws) = state.workspaces.get(&id) {
+                        let path = ws.path.clone();
+                        let ssh = ws.ssh.clone();
+                        let (success, msg) = match git_fetch(&path, ssh.as_ref()).await {
                             Ok(()) => (true, "Fetched".to_string()),
                             Err(e) => (false, e.to_string()),
                         };
                         let _ = evt_tx_task.send(Event::GitActionResult {
                             id, action: "fetch".to_string(), success, message: msg,
                         });
-                        if let Ok(git) = refresh_git(&path).await {
+                        if let Ok(git) = refresh_git(&path, ssh.as_ref()).await {
                             if let Some(ws) = state.workspaces.get_mut(&id) { ws.git = git.clone(); }
                             let _ = evt_tx_task.send(Event::WorkspaceGitUpdated { id, git });
                         }
@@ -329,6 +379,7 @@ pub fn spawn_core() -> CoreHandle {
                 } => {
                     if let Some(ws) = state.workspaces.get_mut(&id) {
                         let cwd = ws.path.clone();
+                        let ssh_target = ws.ssh.clone();
                         let command = if cmd.is_empty() {
                             default_terminal_cmd(kind)
                         } else {
@@ -366,7 +417,7 @@ pub fn spawn_core() -> CoreHandle {
                                 }
                             }
 
-                            match start_terminal(cwd, command).await {
+                            match start_terminal(cwd, command, ssh_target.as_ref()).await {
                                 Ok((session, mut out_rx)) => {
                                     match kind {
                                         protocol::TerminalKind::Agent => {
@@ -554,28 +605,41 @@ pub fn spawn_core() -> CoreHandle {
             let items = workspace_summaries(&state);
             let _ = evt_tx_task.send(Event::WorkspaceList { items });
                 }
-                _ = git_tick.tick() => {
+                _ = git_tick.tick(), if !git_refresh_in_flight => {
                     let pairs: Vec<_> = state.ordered_ids.iter()
-                        .filter_map(|id| state.workspaces.get(id).map(|ws| (*id, ws.path.clone())))
+                        .filter_map(|id| state.workspaces.get(id).map(|ws| (*id, ws.path.clone(), ws.ssh.clone())))
                         .collect();
-                    let results = futures::future::join_all(
-                        pairs.iter().map(|(id, path)| {
-                            let id = *id;
-                            let path = path.clone();
-                            async move { (id, refresh_git(&path).await) }
-                        })
-                    ).await;
-                    for (id, result) in results {
-                        if let Ok(git) = result {
-                            if let Some(ws) = state.workspaces.get_mut(&id) {
-                                ws.git = git.clone();
+                    if !pairs.is_empty() {
+                        git_refresh_in_flight = true;
+                        let tx = git_result_tx.clone();
+                        tokio::spawn(async move {
+                            let results = futures::future::join_all(
+                                pairs.into_iter().map(|(id, path, ssh)| {
+                                    async move {
+                                        GitRefreshResult { id, result: refresh_git(&path, ssh.as_ref()).await }
+                                    }
+                                })
+                            ).await;
+                            for r in results {
+                                let _ = tx.send(r).await;
                             }
-                            let _ = evt_tx_task.send(Event::WorkspaceGitUpdated { id, git });
-                        }
+                        });
                     }
-                    let _ = evt_tx_task.send(Event::WorkspaceList {
-                        items: workspace_summaries(&state),
-                    });
+                }
+                Some(gr) = git_result_rx.recv() => {
+                    if let Ok(git) = gr.result {
+                        if let Some(ws) = state.workspaces.get_mut(&gr.id) {
+                            ws.git = git.clone();
+                        }
+                        let _ = evt_tx_task.send(Event::WorkspaceGitUpdated { id: gr.id, git });
+                    }
+                    // When channel is drained (no more pending), clear in-flight flag
+                    if git_result_rx.is_empty() {
+                        git_refresh_in_flight = false;
+                        let _ = evt_tx_task.send(Event::WorkspaceList {
+                            items: workspace_summaries(&state),
+                        });
+                    }
                 }
             }
         }
@@ -589,18 +653,22 @@ fn workspace_summaries(state: &AppState) -> Vec<WorkspaceSummary> {
         .ordered_ids
         .iter()
         .filter_map(|id| state.workspaces.get(id))
-        .map(|ws| WorkspaceSummary {
-            id: ws.id,
-            name: ws.name.clone(),
-            path: ws.path.display().to_string(),
-            branch: ws.git.branch.clone(),
-            ahead: ws.git.ahead,
-            behind: ws.git.behind,
-            dirty_files: ws.git.changed.len(),
-            attention: ws.attention,
-            agent_running: ws.terminals.agent.is_some(),
-            shell_running: !ws.terminals.shells.is_empty(),
-            last_activity_unix_ms: unix_ms_now(),
+        .map(|ws| {
+            let ssh_host = ws.ssh.as_ref().map(|t| ssh::ssh_destination(t));
+            WorkspaceSummary {
+                id: ws.id,
+                name: ws.name.clone(),
+                path: ws.path.display().to_string(),
+                branch: ws.git.branch.clone(),
+                ahead: ws.git.ahead,
+                behind: ws.git.behind,
+                dirty_files: ws.git.changed.len(),
+                attention: ws.attention,
+                agent_running: ws.terminals.agent.is_some(),
+                shell_running: !ws.terminals.shells.is_empty(),
+                last_activity_unix_ms: unix_ms_now(),
+                ssh_host,
+            }
         })
         .collect::<Vec<_>>()
 }
@@ -633,6 +701,8 @@ fn normalize_tab_id(kind: protocol::TerminalKind, tab_id: Option<String>) -> Str
 struct PersistedWorkspace {
     name: String,
     path: String,
+    #[serde(default)]
+    ssh: Option<SshTarget>,
 }
 
 fn persist_file() -> Option<PathBuf> {
@@ -677,6 +747,7 @@ fn save_workspaces(state: &AppState) {
         .map(|ws| PersistedWorkspace {
             name: ws.name.clone(),
             path: ws.path.display().to_string(),
+            ssh: ws.ssh.clone(),
         })
         .collect::<Vec<_>>();
     if let Ok(json) = serde_json::to_string_pretty(&items) {
@@ -697,11 +768,12 @@ async fn restore_workspaces(state: &mut AppState, evt_tx: &broadcast::Sender<Eve
     for item in items {
         let id = Uuid::new_v4();
         let repo_path = PathBuf::from(item.path);
-        let initial_git = refresh_git(&repo_path).await.unwrap_or_default();
+        let initial_git = refresh_git(&repo_path, item.ssh.as_ref()).await.unwrap_or_default();
         let ws = Workspace {
             id,
             name: item.name,
             path: repo_path,
+            ssh: item.ssh,
             git: initial_git.clone(),
             attention: AttentionLevel::None,
             terminals: Default::default(),

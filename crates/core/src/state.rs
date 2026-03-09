@@ -1,6 +1,6 @@
 use std::{collections::HashMap, path::PathBuf, time::Instant};
 
-use protocol::{AttentionLevel, Route, WorkspaceId};
+use protocol::{AttentionLevel, Route, SshTarget, WorkspaceId};
 
 use crate::workspace::{GitState, WorkspaceTerminals};
 
@@ -26,6 +26,7 @@ pub struct Workspace {
     pub id: WorkspaceId,
     pub name: String,
     pub path: PathBuf,
+    pub ssh: Option<SshTarget>,
     pub git: GitState,
     pub attention: AttentionLevel,
     pub terminals: WorkspaceTerminals,

@@ -35,7 +35,25 @@ fn gap() -> Span<'static> {
 pub fn build_footer_hints(app: &TuiApp) -> Line<'static> {
     let spans = match app.route {
         Route::Home => {
-            if app.is_adding_workspace() {
+            if app.ssh_history_picker.is_some() {
+                vec![
+                    key("j/k"), desc(" navigate"),
+                    gap(),
+                    key("Enter"), desc(" select"),
+                    gap(),
+                    key("n"), desc(" new"),
+                    gap(),
+                    key("Esc"), desc(" cancel"),
+                ]
+            } else if app.is_adding_ssh_workspace() {
+                vec![
+                    key("Tab"), desc(" next field"),
+                    gap(),
+                    key("Enter"), desc(" add"),
+                    gap(),
+                    key("Esc"), desc(" cancel"),
+                ]
+            } else if app.is_adding_workspace() {
                 vec![
                     key("Esc"), desc(" cancel"),
                 ]
@@ -64,6 +82,8 @@ pub fn build_footer_hints(app: &TuiApp) -> Line<'static> {
                     key("Enter"), desc(" open"),
                     gap(),
                     key("n"), desc(" new"),
+                    gap(),
+                    key("R"), desc(" ssh"),
                     gap(),
                     key("e"), desc(" rename"),
                     gap(),

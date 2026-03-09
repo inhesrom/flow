@@ -232,9 +232,14 @@ fn build_branch_line(ws: &WorkspaceSummary, body_max: usize) -> Line<'static> {
 
 fn build_path_line(ws: &WorkspaceSummary, body_max: usize) -> Line<'static> {
     let dim = dim_style();
+    let display_path = if let Some(ref host) = ws.ssh_host {
+        format!("{}:{}", host, ws.path)
+    } else {
+        ws.path.clone()
+    };
     Line::from(vec![
         Span::styled("  ", dim),
-        Span::styled(truncate_end(&ws.path, body_max), dim),
+        Span::styled(truncate_end(&display_path, body_max), dim),
     ])
 }
 

@@ -1,19 +1,95 @@
 use anyhow::Result;
 use std::path::Path;
-use tokio::process::Command;
 
-use protocol::{BranchInfo, ChangedFile, CommitInfo, GitState, RemoteBranchInfo};
+use protocol::{BranchInfo, ChangedFile, CommitInfo, GitState, RemoteBranchInfo, SshTarget};
 
-pub async fn refresh_git(repo: &Path) -> Result<GitState> {
-    let branch_fut = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(repo)
+use super::ssh;
+
+// ---------------------------------------------------------------------------
+// Public entry point — dispatches to SSH-batched or local parallel path
+// ---------------------------------------------------------------------------
+
+pub async fn refresh_git(repo: &Path, ssh: Option<&SshTarget>) -> Result<GitState> {
+    match ssh {
+        Some(target) => refresh_git_ssh(repo, target).await,
+        None => refresh_git_local(repo).await,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SSH batched path — single SSH process for all 7 queries
+// ---------------------------------------------------------------------------
+
+async fn refresh_git_ssh(repo: &Path, target: &SshTarget) -> Result<GitState> {
+    let format = "%h\x1f%s\x1f%an\x1f%cr";
+    let commands: Vec<String> = vec![
+        // 0: branch
+        "git rev-parse --abbrev-ref HEAD 2>/dev/null || echo ''".to_string(),
+        // 1: status
+        "git status --porcelain=v1 2>/dev/null || echo ''".to_string(),
+        // 2: upstream name
+        "git rev-parse --abbrev-ref --symbolic-full-name @{upstream} 2>/dev/null || echo ''"
+            .to_string(),
+        // 3: ahead/behind
+        "git rev-list --left-right --count HEAD...@{upstream} 2>/dev/null || echo ''".to_string(),
+        // 4: recent commits
+        format!(
+            "git log -20 --format='{}' 2>/dev/null || echo ''",
+            format
+        ),
+        // 5: local branches
+        "git for-each-ref --format='%(HEAD) %(refname:short) %(upstream:track)' refs/heads/ 2>/dev/null || echo ''".to_string(),
+        // 6: remote branches
+        "git for-each-ref --format='%(refname:short)' refs/remotes/ 2>/dev/null || echo ''"
+            .to_string(),
+    ];
+
+    let out = ssh::build_batch_command(target, repo, &commands)
+        .output()
+        .await?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let sections: Vec<&str> = stdout.split(ssh::BATCH_DELIM).collect();
+
+    // Helper: get section by index, trimmed
+    let section = |i: usize| -> &str {
+        sections.get(i).map(|s| s.trim()).unwrap_or("")
+    };
+
+    let branch = parse_branch_output(section(0));
+    let changed = parse_status_output(section(1));
+    let upstream = parse_upstream_name(section(2));
+    let (ahead, behind) = if upstream.is_some() {
+        parse_ahead_behind(section(3))
+    } else {
+        (None, None)
+    };
+    let recent_commits = parse_commits_output(section(4));
+    let local_branches = parse_local_branches_output(section(5));
+    let remote_branches = parse_remote_branches_output(section(6));
+
+    Ok(GitState {
+        branch,
+        upstream,
+        ahead,
+        behind,
+        changed,
+        recent_commits,
+        local_branches,
+        remote_branches,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Local parallel path — unchanged logic, uses tokio::join!
+// ---------------------------------------------------------------------------
+
+async fn refresh_git_local(repo: &Path) -> Result<GitState> {
+    let branch_fut = ssh::build_command(None, repo, "git", &["rev-parse", "--abbrev-ref", "HEAD"])
         .output();
 
-    let status_fut = Command::new("git")
-        .args(["status", "--porcelain=v1"])
-        .current_dir(repo)
-        .output();
+    let status_fut =
+        ssh::build_command(None, repo, "git", &["status", "--porcelain=v1"]).output();
 
     let upstream_fut = get_upstream_status(repo);
     let commits_fut = get_recent_commits(repo, 20);
@@ -54,139 +130,41 @@ pub async fn refresh_git(repo: &Path) -> Result<GitState> {
     })
 }
 
-async fn get_upstream_status(repo: &Path) -> (Option<String>, Option<u32>, Option<u32>) {
-    let upstream_out = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])
-        .current_dir(repo)
-        .output()
-        .await;
+// ---------------------------------------------------------------------------
+// Pure parsing functions (shared by both paths)
+// ---------------------------------------------------------------------------
 
-    let upstream = match upstream_out {
-        Ok(out) if out.status.success() => {
-            let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if name.is_empty() {
-                return (None, None, None);
-            }
-            Some(name)
-        }
-        _ => return (None, None, None),
-    };
-
-    let count_out = Command::new("git")
-        .args(["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
-        .current_dir(repo)
-        .output()
-        .await;
-
-    let (ahead, behind) = match count_out {
-        Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            let parts: Vec<&str> = text.trim().split('\t').collect();
-            if parts.len() == 2 {
-                let a = parts[0].parse::<u32>().unwrap_or(0);
-                let b = parts[1].parse::<u32>().unwrap_or(0);
-                (Some(a), Some(b))
-            } else {
-                (Some(0), Some(0))
-            }
-        }
-        _ => (None, None),
-    };
-
-    (upstream, ahead, behind)
+fn parse_branch_output(output: &str) -> Option<String> {
+    let s = output.trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
 }
 
-pub async fn diff_file(repo: &Path, file: &str) -> Result<String> {
-    let out = Command::new("git")
-        .arg("diff")
-        .arg("--")
-        .arg(file)
-        .current_dir(repo)
-        .output()
-        .await?;
-
-    let text = String::from_utf8_lossy(&out.stdout).to_string();
-    if !text.trim().is_empty() {
-        return Ok(text);
-    }
-
-    let tracked = Command::new("git")
-        .arg("ls-files")
-        .arg("--error-unmatch")
-        .arg("--")
-        .arg(file)
-        .current_dir(repo)
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if tracked {
-        return Ok(text);
-    }
-
-    let full_path = repo.join(file);
-    if !full_path.exists() {
-        return Ok(text);
-    }
-    if full_path.is_dir() {
-        return Ok(format!(
-            "Untracked directory: {file}\n(no file-level diff available)\n"
-        ));
-    }
-
-    let bytes = std::fs::read(&full_path)?;
-    if bytes.iter().any(|b| *b == 0) {
-        return Ok(format!("Binary file added: {file}\n"));
-    }
-
-    let mut diff = String::new();
-    diff.push_str(&format!("diff --git a/{file} b/{file}\n"));
-    diff.push_str("new file mode 100644\n");
-    diff.push_str("--- /dev/null\n");
-    diff.push_str(&format!("+++ b/{file}\n"));
-    diff.push_str("@@ -0,0 +1 @@\n");
-    for line in String::from_utf8_lossy(&bytes).lines() {
-        diff.push('+');
-        diff.push_str(line);
-        diff.push('\n');
-    }
-    Ok(diff)
+fn parse_status_output(output: &str) -> Vec<ChangedFile> {
+    output
+        .lines()
+        .filter_map(parse_porcelain_line)
+        .collect()
 }
 
-fn parse_porcelain_line(line: &str) -> Option<ChangedFile> {
-    if line.len() < 3 {
-        return None;
-    }
-
-    let bytes = line.as_bytes();
-    let index_status = bytes[0] as char;
-    let worktree_status = bytes[1] as char;
-    let path = line[3..].trim().to_string();
-    if path.is_empty() {
-        return None;
-    }
-
-    Some(ChangedFile {
-        path,
-        index_status,
-        worktree_status,
-    })
+fn parse_upstream_name(output: &str) -> Option<String> {
+    let s = output.trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
 }
 
-async fn get_recent_commits(repo: &Path, count: usize) -> Vec<CommitInfo> {
-    let format = "%h\x1f%s\x1f%an\x1f%cr";
-    let out = Command::new("git")
-        .args(["log", &format!("-{count}"), &format!("--format={format}")])
-        .current_dir(repo)
-        .output()
-        .await;
-
-    let Ok(out) = out else { return Vec::new() };
-    if !out.status.success() {
-        return Vec::new();
+fn parse_ahead_behind(output: &str) -> (Option<u32>, Option<u32>) {
+    let text = output.trim();
+    let parts: Vec<&str> = text.split('\t').collect();
+    if parts.len() == 2 {
+        let a = parts[0].parse::<u32>().unwrap_or(0);
+        let b = parts[1].parse::<u32>().unwrap_or(0);
+        (Some(a), Some(b))
+    } else {
+        (None, None)
     }
+}
 
-    String::from_utf8_lossy(&out.stdout)
+fn parse_commits_output(output: &str) -> Vec<CommitInfo> {
+    output
         .lines()
         .filter_map(|line| {
             let parts: Vec<&str> = line.splitn(4, '\x1f').collect();
@@ -204,88 +182,8 @@ async fn get_recent_commits(repo: &Path, count: usize) -> Vec<CommitInfo> {
         .collect()
 }
 
-pub async fn diff_commit(repo: &Path, hash: &str) -> Result<String> {
-    let out = Command::new("git")
-        .args(["show", hash, "--format="])
-        .current_dir(repo)
-        .output()
-        .await?;
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
-}
-
-pub async fn stage_file(repo: &Path, file: &str) -> Result<()> {
-    let out = Command::new("git")
-        .args(["add", "--", file])
-        .current_dir(repo)
-        .output()
-        .await?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "git add failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    Ok(())
-}
-
-pub async fn unstage_file(repo: &Path, file: &str) -> Result<()> {
-    let out = Command::new("git")
-        .args(["reset", "HEAD", "--", file])
-        .current_dir(repo)
-        .output()
-        .await?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "git reset failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    Ok(())
-}
-
-pub async fn stage_all(repo: &Path) -> Result<()> {
-    let out = Command::new("git")
-        .args(["add", "-A"])
-        .current_dir(repo)
-        .output()
-        .await?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "git add -A failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    Ok(())
-}
-
-pub async fn unstage_all(repo: &Path) -> Result<()> {
-    let out = Command::new("git")
-        .args(["reset", "HEAD"])
-        .current_dir(repo)
-        .output()
-        .await?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "git reset failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    Ok(())
-}
-
-async fn get_local_branches(repo: &Path) -> Vec<BranchInfo> {
-    let out = Command::new("git")
-        .args(["for-each-ref", "--format=%(HEAD) %(refname:short) %(upstream:track)", "refs/heads/"])
-        .current_dir(repo)
-        .output()
-        .await;
-
-    let Ok(out) = out else { return Vec::new() };
-    if !out.status.success() {
-        return Vec::new();
-    }
-
-    String::from_utf8_lossy(&out.stdout)
+fn parse_local_branches_output(output: &str) -> Vec<BranchInfo> {
+    output
         .lines()
         .filter_map(|line| {
             let line = line.trim_end();
@@ -315,6 +213,155 @@ async fn get_local_branches(repo: &Path) -> Vec<BranchInfo> {
         .collect()
 }
 
+fn parse_remote_branches_output(output: &str) -> Vec<RemoteBranchInfo> {
+    output
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.trim().ends_with("/HEAD"))
+        .map(|line| RemoteBranchInfo {
+            full_name: line.trim().to_string(),
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Local-only async helpers (used by refresh_git_local)
+// ---------------------------------------------------------------------------
+
+async fn get_upstream_status(
+    repo: &Path,
+) -> (Option<String>, Option<u32>, Option<u32>) {
+    let upstream_out = ssh::build_command(
+        None,
+        repo,
+        "git",
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    )
+    .output()
+    .await;
+
+    let upstream = match upstream_out {
+        Ok(out) if out.status.success() => {
+            let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if name.is_empty() {
+                return (None, None, None);
+            }
+            Some(name)
+        }
+        _ => return (None, None, None),
+    };
+
+    let count_out = ssh::build_command(
+        None,
+        repo,
+        "git",
+        &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+    )
+    .output()
+    .await;
+
+    let (ahead, behind) = match count_out {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let parts: Vec<&str> = text.trim().split('\t').collect();
+            if parts.len() == 2 {
+                let a = parts[0].parse::<u32>().unwrap_or(0);
+                let b = parts[1].parse::<u32>().unwrap_or(0);
+                (Some(a), Some(b))
+            } else {
+                (Some(0), Some(0))
+            }
+        }
+        _ => (None, None),
+    };
+
+    (upstream, ahead, behind)
+}
+
+async fn get_recent_commits(repo: &Path, count: usize) -> Vec<CommitInfo> {
+    let format = "%h\x1f%s\x1f%an\x1f%cr";
+    let count_arg = format!("-{count}");
+    let format_arg = format!("--format={format}");
+    let out = ssh::build_command(None, repo, "git", &["log", &count_arg, &format_arg])
+        .output()
+        .await;
+
+    let Ok(out) = out else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+
+    parse_commits_output(&String::from_utf8_lossy(&out.stdout))
+}
+
+async fn get_local_branches(repo: &Path) -> Vec<BranchInfo> {
+    let out = ssh::build_command(
+        None,
+        repo,
+        "git",
+        &[
+            "for-each-ref",
+            "--format=%(HEAD) %(refname:short) %(upstream:track)",
+            "refs/heads/",
+        ],
+    )
+    .output()
+    .await;
+
+    let Ok(out) = out else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+
+    parse_local_branches_output(&String::from_utf8_lossy(&out.stdout))
+}
+
+async fn get_remote_branches(repo: &Path) -> Vec<RemoteBranchInfo> {
+    let out = ssh::build_command(
+        None,
+        repo,
+        "git",
+        &["for-each-ref", "--format=%(refname:short)", "refs/remotes/"],
+    )
+    .output()
+    .await;
+
+    let Ok(out) = out else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+
+    parse_remote_branches_output(&String::from_utf8_lossy(&out.stdout))
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+fn parse_porcelain_line(line: &str) -> Option<ChangedFile> {
+    if line.len() < 3 {
+        return None;
+    }
+
+    let bytes = line.as_bytes();
+    let index_status = bytes[0] as char;
+    let worktree_status = bytes[1] as char;
+    let path = line[3..].trim().to_string();
+    if path.is_empty() {
+        return None;
+    }
+
+    Some(ChangedFile {
+        path,
+        index_status,
+        worktree_status,
+    })
+}
+
 fn parse_track_info(info: &str) -> (Option<u32>, Option<u32>) {
     // Parses "[ahead N]", "[behind N]", "[ahead N, behind M]", or "[gone]"
     let trimmed = info.trim().trim_start_matches('[').trim_end_matches(']');
@@ -334,31 +381,161 @@ fn parse_track_info(info: &str) -> (Option<u32>, Option<u32>) {
     (ahead, behind)
 }
 
-async fn get_remote_branches(repo: &Path) -> Vec<RemoteBranchInfo> {
-    let out = Command::new("git")
-        .args(["for-each-ref", "--format=%(refname:short)", "refs/remotes/"])
-        .current_dir(repo)
-        .output()
-        .await;
+// ---------------------------------------------------------------------------
+// Public single-command operations (unchanged — these are user-initiated)
+// ---------------------------------------------------------------------------
 
-    let Ok(out) = out else { return Vec::new() };
-    if !out.status.success() {
-        return Vec::new();
+pub async fn diff_file(repo: &Path, file: &str, ssh: Option<&SshTarget>) -> Result<String> {
+    let out = ssh::build_command(ssh, repo, "git", &["diff", "--", file])
+        .output()
+        .await?;
+
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    if !text.trim().is_empty() {
+        return Ok(text);
     }
 
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|line| !line.trim().is_empty() && !line.trim().ends_with("/HEAD"))
-        .map(|line| RemoteBranchInfo {
-            full_name: line.trim().to_string(),
-        })
-        .collect()
+    let tracked = ssh::build_command(ssh, repo, "git", &["ls-files", "--error-unmatch", "--", file])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if tracked {
+        return Ok(text);
+    }
+
+    // For untracked files, check existence and read content
+    if ssh.is_some() {
+        // SSH: use remote commands to check and read
+        let exists_out = ssh::build_command(ssh, repo, "test", &["-e", file])
+            .output()
+            .await;
+        if !exists_out.map(|o| o.status.success()).unwrap_or(false) {
+            return Ok(text);
+        }
+
+        let is_dir_out = ssh::build_command(ssh, repo, "test", &["-d", file])
+            .output()
+            .await;
+        if is_dir_out.map(|o| o.status.success()).unwrap_or(false) {
+            return Ok(format!(
+                "Untracked directory: {file}\n(no file-level diff available)\n"
+            ));
+        }
+
+        let cat_out = ssh::build_command(ssh, repo, "cat", &[file])
+            .output()
+            .await?;
+        let bytes = cat_out.stdout;
+        if bytes.iter().any(|b| *b == 0) {
+            return Ok(format!("Binary file added: {file}\n"));
+        }
+
+        let mut diff = String::new();
+        diff.push_str(&format!("diff --git a/{file} b/{file}\n"));
+        diff.push_str("new file mode 100644\n");
+        diff.push_str("--- /dev/null\n");
+        diff.push_str(&format!("+++ b/{file}\n"));
+        diff.push_str("@@ -0,0 +1 @@\n");
+        for line in String::from_utf8_lossy(&bytes).lines() {
+            diff.push('+');
+            diff.push_str(line);
+            diff.push('\n');
+        }
+        Ok(diff)
+    } else {
+        // Local: use filesystem directly
+        let full_path = repo.join(file);
+        if !full_path.exists() {
+            return Ok(text);
+        }
+        if full_path.is_dir() {
+            return Ok(format!(
+                "Untracked directory: {file}\n(no file-level diff available)\n"
+            ));
+        }
+
+        let bytes = std::fs::read(&full_path)?;
+        if bytes.iter().any(|b| *b == 0) {
+            return Ok(format!("Binary file added: {file}\n"));
+        }
+
+        let mut diff = String::new();
+        diff.push_str(&format!("diff --git a/{file} b/{file}\n"));
+        diff.push_str("new file mode 100644\n");
+        diff.push_str("--- /dev/null\n");
+        diff.push_str(&format!("+++ b/{file}\n"));
+        diff.push_str("@@ -0,0 +1 @@\n");
+        for line in String::from_utf8_lossy(&bytes).lines() {
+            diff.push('+');
+            diff.push_str(line);
+            diff.push('\n');
+        }
+        Ok(diff)
+    }
 }
 
-pub async fn create_branch(repo: &Path, branch: &str) -> Result<()> {
-    let out = Command::new("git")
-        .args(["checkout", "-b", branch])
-        .current_dir(repo)
+pub async fn diff_commit(repo: &Path, hash: &str, ssh: Option<&SshTarget>) -> Result<String> {
+    let out = ssh::build_command(ssh, repo, "git", &["show", hash, "--format="])
+        .output()
+        .await?;
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+pub async fn stage_file(repo: &Path, file: &str, ssh: Option<&SshTarget>) -> Result<()> {
+    let out = ssh::build_command(ssh, repo, "git", &["add", "--", file])
+        .output()
+        .await?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+pub async fn unstage_file(repo: &Path, file: &str, ssh: Option<&SshTarget>) -> Result<()> {
+    let out = ssh::build_command(ssh, repo, "git", &["reset", "HEAD", "--", file])
+        .output()
+        .await?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git reset failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+pub async fn stage_all(repo: &Path, ssh: Option<&SshTarget>) -> Result<()> {
+    let out = ssh::build_command(ssh, repo, "git", &["add", "-A"])
+        .output()
+        .await?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git add -A failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+pub async fn unstage_all(repo: &Path, ssh: Option<&SshTarget>) -> Result<()> {
+    let out = ssh::build_command(ssh, repo, "git", &["reset", "HEAD"])
+        .output()
+        .await?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git reset failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+pub async fn create_branch(repo: &Path, branch: &str, ssh: Option<&SshTarget>) -> Result<()> {
+    let out = ssh::build_command(ssh, repo, "git", &["checkout", "-b", branch])
         .output()
         .await?;
     if !out.status.success() {
@@ -370,10 +547,8 @@ pub async fn create_branch(repo: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn checkout_branch(repo: &Path, branch: &str) -> Result<()> {
-    let out = Command::new("git")
-        .args(["checkout", branch])
-        .current_dir(repo)
+pub async fn checkout_branch(repo: &Path, branch: &str, ssh: Option<&SshTarget>) -> Result<()> {
+    let out = ssh::build_command(ssh, repo, "git", &["checkout", branch])
         .output()
         .await?;
     if !out.status.success() {
@@ -385,10 +560,13 @@ pub async fn checkout_branch(repo: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn checkout_remote_branch(repo: &Path, remote_branch: &str, local_name: &str) -> Result<()> {
-    let out = Command::new("git")
-        .args(["checkout", "-b", local_name, remote_branch])
-        .current_dir(repo)
+pub async fn checkout_remote_branch(
+    repo: &Path,
+    remote_branch: &str,
+    local_name: &str,
+    ssh: Option<&SshTarget>,
+) -> Result<()> {
+    let out = ssh::build_command(ssh, repo, "git", &["checkout", "-b", local_name, remote_branch])
         .output()
         .await?;
     if !out.status.success() {
@@ -400,10 +578,8 @@ pub async fn checkout_remote_branch(repo: &Path, remote_branch: &str, local_name
     Ok(())
 }
 
-pub async fn git_push(repo: &Path) -> Result<()> {
-    let out = Command::new("git")
-        .args(["push", "-u", "origin", "HEAD"])
-        .current_dir(repo)
+pub async fn git_push(repo: &Path, ssh: Option<&SshTarget>) -> Result<()> {
+    let out = ssh::build_command(ssh, repo, "git", &["push", "-u", "origin", "HEAD"])
         .output()
         .await?;
     if !out.status.success() {
@@ -412,10 +588,8 @@ pub async fn git_push(repo: &Path) -> Result<()> {
     Ok(())
 }
 
-pub async fn git_pull(repo: &Path) -> Result<()> {
-    let out = Command::new("git")
-        .args(["pull"])
-        .current_dir(repo)
+pub async fn git_pull(repo: &Path, ssh: Option<&SshTarget>) -> Result<()> {
+    let out = ssh::build_command(ssh, repo, "git", &["pull"])
         .output()
         .await?;
     if !out.status.success() {
@@ -424,10 +598,8 @@ pub async fn git_pull(repo: &Path) -> Result<()> {
     Ok(())
 }
 
-pub async fn git_fetch(repo: &Path) -> Result<()> {
-    let out = Command::new("git")
-        .args(["fetch"])
-        .current_dir(repo)
+pub async fn git_fetch(repo: &Path, ssh: Option<&SshTarget>) -> Result<()> {
+    let out = ssh::build_command(ssh, repo, "git", &["fetch"])
         .output()
         .await?;
     if !out.status.success() {
@@ -436,10 +608,8 @@ pub async fn git_fetch(repo: &Path) -> Result<()> {
     Ok(())
 }
 
-pub async fn commit(repo: &Path, message: &str) -> Result<()> {
-    let out = Command::new("git")
-        .args(["commit", "-m", message])
-        .current_dir(repo)
+pub async fn commit(repo: &Path, message: &str, ssh: Option<&SshTarget>) -> Result<()> {
+    let out = ssh::build_command(ssh, repo, "git", &["commit", "-m", message])
         .output()
         .await?;
     if !out.status.success() {

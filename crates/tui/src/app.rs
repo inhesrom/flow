@@ -12,6 +12,61 @@ use serde::{Deserialize, Serialize};
 
 use crate::ui::widgets::tile_grid;
 
+const SSH_HISTORY_MAX: usize = 20;
+
+/// Tracks the state of the SSH workspace creation dialog.
+pub struct SshWorkspaceInput {
+    pub host: String,
+    pub user: String,
+    pub path: String,
+    pub focused_field: SshField,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshField {
+    Host,
+    User,
+    Path,
+}
+
+impl SshWorkspaceInput {
+    pub fn new() -> Self {
+        Self {
+            host: String::new(),
+            user: String::new(),
+            path: String::new(),
+            focused_field: SshField::Host,
+        }
+    }
+
+    pub fn cycle_field(&mut self) {
+        self.focused_field = match self.focused_field {
+            SshField::Host => SshField::User,
+            SshField::User => SshField::Path,
+            SshField::Path => SshField::Host,
+        };
+    }
+
+    pub fn active_input_mut(&mut self) -> &mut String {
+        match self.focused_field {
+            SshField::Host => &mut self.host,
+            SshField::User => &mut self.user,
+            SshField::Path => &mut self.path,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SshHistoryEntry {
+    pub host: String,
+    pub user: Option<String>,
+    pub path: String,
+}
+
+pub struct SshHistoryPicker {
+    pub selected: usize,
+}
+
 /// Tracks the state of the interactive directory browser shown when adding a workspace.
 pub struct DirBrowserState {
     /// The filesystem path currently shown in the browser.
@@ -225,6 +280,9 @@ pub struct TuiApp {
     pub mouse_selection: Option<MouseSelection>,
     /// Set on mouse-up to request clipboard copy on the next frame render.
     pub pending_copy_selection: Option<MouseSelection>,
+    pub ssh_workspace_input: Option<SshWorkspaceInput>,
+    pub ssh_history: Vec<SshHistoryEntry>,
+    pub ssh_history_picker: Option<SshHistoryPicker>,
 }
 
 impl Default for TuiApp {
@@ -267,6 +325,9 @@ impl Default for TuiApp {
             settings_selected: 0,
             mouse_selection: None,
             pending_copy_selection: None,
+            ssh_workspace_input: None,
+            ssh_history: load_ssh_history(),
+            ssh_history_picker: None,
         }
     }
 }
@@ -441,6 +502,78 @@ impl TuiApp {
             }
         }
         self.persist_tabs_for_active_workspace();
+    }
+
+    pub fn begin_add_ssh_workspace(&mut self) {
+        if self.ssh_history.is_empty() {
+            self.ssh_workspace_input = Some(SshWorkspaceInput::new());
+        } else {
+            self.ssh_history_picker = Some(SshHistoryPicker { selected: 0 });
+        }
+    }
+
+    pub fn cancel_ssh_workspace(&mut self) {
+        self.ssh_workspace_input = None;
+    }
+
+    pub fn cancel_ssh_history_picker(&mut self) {
+        self.ssh_history_picker = None;
+    }
+
+    pub fn select_ssh_history_entry(&mut self) {
+        if let Some(picker) = self.ssh_history_picker.take() {
+            if let Some(entry) = self.ssh_history.get(picker.selected) {
+                let mut input = SshWorkspaceInput::new();
+                input.host = entry.host.clone();
+                input.user = entry.user.clone().unwrap_or_default();
+                input.path = entry.path.clone();
+                self.ssh_workspace_input = Some(input);
+            }
+        }
+    }
+
+    pub fn begin_new_ssh_from_picker(&mut self) {
+        self.ssh_history_picker = None;
+        self.ssh_workspace_input = Some(SshWorkspaceInput::new());
+    }
+
+    pub fn record_ssh_history(&mut self, entry: SshHistoryEntry) {
+        self.ssh_history.retain(|e| e != &entry);
+        self.ssh_history.insert(0, entry);
+        self.ssh_history.truncate(SSH_HISTORY_MAX);
+        save_ssh_history(&self.ssh_history);
+    }
+
+    pub fn is_adding_ssh_workspace(&self) -> bool {
+        self.ssh_workspace_input.is_some()
+    }
+
+    pub fn take_ssh_workspace_request(&mut self) -> Option<(String, String, protocol::SshTarget)> {
+        let input = self.ssh_workspace_input.take()?;
+        let host = input.host.trim().to_string();
+        let path = input.path.trim().to_string();
+        if host.is_empty() || path.is_empty() {
+            return None;
+        }
+        let user = if input.user.trim().is_empty() {
+            None
+        } else {
+            Some(input.user.trim().to_string())
+        };
+        let name = format!(
+            "{}:{}",
+            &host,
+            std::path::Path::new(&path)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "workspace".to_string())
+        );
+        let target = protocol::SshTarget {
+            host,
+            user,
+            port: None,
+        };
+        Some((name, path, target))
     }
 
     pub fn begin_add_workspace(&mut self, initial_path: String) {
@@ -1204,4 +1337,37 @@ fn save_settings(settings: &Settings) -> anyhow::Result<()> {
     let raw = serde_json::to_string_pretty(settings)?;
     fs::write(path, raw)?;
     Ok(())
+}
+
+fn ssh_history_path() -> Option<PathBuf> {
+    let base = if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        PathBuf::from(xdg)
+    } else if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(".config")
+    } else {
+        return None;
+    };
+    Some(base.join("anvl").join("ssh_history.json"))
+}
+
+fn load_ssh_history() -> Vec<SshHistoryEntry> {
+    let Some(path) = ssh_history_path() else {
+        return Vec::new();
+    };
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+fn save_ssh_history(history: &[SshHistoryEntry]) {
+    let Some(path) = ssh_history_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(raw) = serde_json::to_string_pretty(history) {
+        let _ = fs::write(path, raw);
+    }
 }
