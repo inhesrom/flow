@@ -1770,7 +1770,13 @@ fn key_to_terminal_bytes(key: KeyEvent) -> Option<Vec<u8>> {
             }
         }
         KeyCode::Esc => Some(vec![0x1b]),
-        KeyCode::Enter => Some(vec![b'\r']),
+        KeyCode::Enter => {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                Some(vec![b'\n'])
+            } else {
+                Some(vec![b'\r'])
+            }
+        }
         KeyCode::Backspace => Some(vec![0x7f]),
         KeyCode::Tab => Some(vec![b'\t']),
         KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
