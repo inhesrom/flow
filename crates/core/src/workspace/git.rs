@@ -43,7 +43,7 @@ async fn refresh_git_ssh(repo: &Path, target: &SshTarget) -> Result<GitState> {
         "git for-each-ref --format='%(refname:short)' refs/remotes/ 2>/dev/null || echo ''"
             .to_string(),
         // 7: tags
-        "git tag --sort=-creatordate --format='%(refname:short)\x1f%(objectname:short)\x1f%(creatordate:relative)' 2>/dev/null | head -20 || echo ''".to_string(),
+        "git for-each-ref --sort=-creatordate refs/tags/ --format='%(refname:short)\x1f%(if)%(*objectname:short)%(then)%(*objectname:short)%(else)%(objectname:short)%(end)\x1f%(creatordate:relative)' 2>/dev/null | head -20 || echo ''".to_string(),
     ];
 
     let out = ssh::build_batch_command(target, repo, &commands)
@@ -363,12 +363,12 @@ async fn get_remote_branches(repo: &Path) -> Vec<RemoteBranchInfo> {
 }
 
 async fn get_tags(repo: &Path) -> Vec<TagInfo> {
-    let format_arg = "--format=%(refname:short)\x1f%(objectname:short)\x1f%(creatordate:relative)";
+    let format_arg = "--format=%(refname:short)\x1f%(if)%(*objectname:short)%(then)%(*objectname:short)%(else)%(objectname:short)%(end)\x1f%(creatordate:relative)";
     let out = ssh::build_command(
         None,
         repo,
         "git",
-        &["tag", "--sort=-creatordate", format_arg],
+        &["for-each-ref", "--sort=-creatordate", "refs/tags/", format_arg],
     )
     .output()
     .await;

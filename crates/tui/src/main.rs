@@ -1580,7 +1580,6 @@ async fn run_tui(mut backend: Backend) -> Result<()> {
                                                         .await;
                                                 }
                                             }
-                                            _ => {}
                                         }
                                     }
                                 }
@@ -1698,6 +1697,12 @@ async fn run_tui(mut backend: Backend) -> Result<()> {
                                         && app.log_item_is_file_context() =>
                                 {
                                     app.stash_input = Some(String::new());
+                                }
+                                KeyCode::Char('t')
+                                    if matches!(app.focus, app::Focus::WsLog) =>
+                                {
+                                    app.ws_tag_filter = !app.ws_tag_filter;
+                                    app.ws_selected_commit = app.ws_selected_commit.min(app.total_log_items().saturating_sub(1));
                                 }
                                 KeyCode::Char('c')
                                     if matches!(app.focus, app::Focus::WsBranches) =>

@@ -322,42 +322,50 @@ pub fn render(frame: &mut Frame, area: Rect, app: &TuiApp) {
         }
     }
 
+    // Build tag lookup: commit hash → list of tag names
+    let tag_map = {
+        let mut m: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        for t in &tags {
+            m.entry(t.hash.clone()).or_default().push(t.name.clone());
+        }
+        m
+    };
+
     // Commits
     for (i, c) in commits.iter().enumerate() {
+        // When tag filter is active, skip commits without tags
+        if app.ws_tag_filter && !tag_map.contains_key(&c.hash) {
+            continue;
+        }
         let is_expanded = app.ws_expanded_commit == Some(i);
         let arrow = if is_expanded { "▼ " } else { "▶ " };
-        log_items.push(ListItem::new(Line::from(vec![
+        let mut spans = vec![
             Span::styled(
                 format!("{arrow}{} ", c.hash),
                 Style::default().fg(Color::Yellow),
             ),
-            Span::raw(&c.message),
-            Span::styled(
-                format!(" ({}, {})", c.author, c.date),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])));
+        ];
+        // Inline tag badges right after hash
+        if let Some(tag_names) = tag_map.get(&c.hash) {
+            for name in tag_names {
+                spans.push(Span::styled(
+                    format!("[{name}] "),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+        spans.push(Span::raw(&c.message));
+        spans.push(Span::styled(
+            format!(" ({}, {})", c.author, c.date),
+            Style::default().fg(Color::DarkGray),
+        ));
+        log_items.push(ListItem::new(Line::from(spans)));
         if is_expanded {
             if let Some(files) = app.commit_files_cache.get(&c.hash) {
                 for f in files {
                     log_items.push(ListItem::new(Line::from(Span::raw(format!("    {f}")))));
                 }
             }
-        }
-    }
-
-    // Tags
-    if !tags.is_empty() {
-        log_items.push(ListItem::new(Line::from(Span::styled(
-            "─── Tags ───",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
-        ))));
-        for t in &tags {
-            log_items.push(ListItem::new(Line::from(vec![
-                Span::styled(format!("{} ", t.hash), Style::default().fg(Color::Yellow)),
-                Span::raw(&t.name),
-                Span::styled(format!(" ({})", t.date), Style::default().fg(Color::DarkGray)),
-            ])));
         }
     }
 

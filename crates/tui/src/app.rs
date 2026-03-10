@@ -241,8 +241,6 @@ pub enum LogItem {
     ChangedFile(usize),
     Commit(usize),
     CommitFile(usize, usize),
-    TagDivider,
-    Tag(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,6 +298,7 @@ pub struct TuiApp {
     pub terminal_fullscreen: bool,
     pub ws_expanded_commit: Option<usize>,
     pub commit_files_cache: HashMap<String, Vec<String>>,
+    pub ws_tag_filter: bool,
 }
 
 impl Default for TuiApp {
@@ -352,6 +351,7 @@ impl Default for TuiApp {
             terminal_fullscreen: false,
             ws_expanded_commit: None,
             commit_files_cache: HashMap::new(),
+            ws_tag_filter: false,
         }
     }
 }
@@ -831,6 +831,18 @@ impl TuiApp {
         lines
     }
 
+    pub fn tag_map(&self) -> HashMap<String, Vec<String>> {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        if let Some(id) = self.active_workspace_id() {
+            if let Some(git) = self.workspace_git.get(&id) {
+                for t in &git.tags {
+                    map.entry(t.hash.clone()).or_default().push(t.name.clone());
+                }
+            }
+        }
+        map
+    }
+
     pub fn total_log_items(&self) -> usize {
         let Some(id) = self.active_workspace_id() else {
             return 1; // just the header
@@ -843,9 +855,25 @@ impl TuiApp {
         } else {
             0
         };
-        let expanded_commit_files = self.expanded_commit_file_count(git);
-        let tag_count = if git.tags.is_empty() { 0 } else { 1 + git.tags.len() };
-        1 + file_count + git.recent_commits.len() + expanded_commit_files + tag_count
+        if self.ws_tag_filter {
+            let tag_map = self.tag_map();
+            let mut count = 1 + file_count; // header + uncommitted files
+            for (i, c) in git.recent_commits.iter().enumerate() {
+                if !tag_map.contains_key(&c.hash) {
+                    continue;
+                }
+                count += 1;
+                if self.ws_expanded_commit == Some(i) {
+                    if let Some(files) = self.commit_files_cache.get(&c.hash) {
+                        count += files.len();
+                    }
+                }
+            }
+            count
+        } else {
+            let expanded_commit_files = self.expanded_commit_file_count(git);
+            1 + file_count + git.recent_commits.len() + expanded_commit_files
+        }
     }
 
     fn expanded_commit_file_count(&self, git: &GitState) -> usize {
@@ -883,7 +911,13 @@ impl TuiApp {
         offset -= file_count;
 
         // Commits with optional expanded file lists
+        let tag_map = if self.ws_tag_filter { Some(self.tag_map()) } else { None };
         for i in 0..git.recent_commits.len() {
+            if let Some(ref tm) = tag_map {
+                if !tm.contains_key(&git.recent_commits[i].hash) {
+                    continue;
+                }
+            }
             if offset == 0 {
                 return LogItem::Commit(i);
             }
@@ -898,15 +932,6 @@ impl TuiApp {
             }
         }
 
-        if !git.tags.is_empty() {
-            if offset == 0 {
-                return LogItem::TagDivider;
-            }
-            offset -= 1;
-            if offset < git.tags.len() {
-                return LogItem::Tag(offset);
-            }
-        }
         LogItem::UncommittedHeader // fallback
     }
 
@@ -933,14 +958,7 @@ impl TuiApp {
             self.ws_selected_commit = 0;
             return;
         }
-        let mut next = (self.ws_selected_commit as isize + delta).clamp(0, total as isize - 1) as usize;
-        // Skip tag divider
-        if matches!(self.log_item_at(next), LogItem::TagDivider) {
-            let stepped = (next as isize + delta.signum()).clamp(0, total as isize - 1) as usize;
-            if stepped != next {
-                next = stepped;
-            }
-        }
+        let next = (self.ws_selected_commit as isize + delta).clamp(0, total as isize - 1) as usize;
         self.ws_selected_commit = next;
     }
 
