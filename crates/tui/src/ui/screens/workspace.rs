@@ -678,7 +678,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &TuiApp) {
         if ts.elapsed() < std::time::Duration::from_secs(3) {
             let toast_width = (msg.len() as u16 + 4).min(area.width);
             let toast_rect = Rect::new(
-                area.x + area.width.saturating_sub(toast_width) - 1,
+                area.x + area.width.saturating_sub(toast_width).saturating_sub(1),
                 area.y + area.height.saturating_sub(4),
                 toast_width,
                 3,
