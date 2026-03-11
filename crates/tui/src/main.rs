@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
+use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 #[derive(Debug)]
 enum LaunchMode {
@@ -2134,6 +2135,10 @@ async fn handle_mouse(
         Err(_) => return,
     };
 
+    if forward_mouse_to_terminal(app, cmd_tx, area, mouse).await {
+        return;
+    }
+
     // Handle drag selection (works across all routes/panes)
     match mouse.kind {
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -2280,6 +2285,176 @@ async fn handle_mouse(
 
 fn point_in_rect(r: ratatui::layout::Rect, x: u16, y: u16) -> bool {
     x >= r.x && y >= r.y && x < r.right() && y < r.bottom()
+}
+
+async fn forward_mouse_to_terminal(
+    app: &mut TuiApp,
+    cmd_tx: &tokio::sync::mpsc::Sender<Command>,
+    area: ratatui::layout::Rect,
+    mouse: MouseEvent,
+) -> bool {
+    let Route::Workspace { id } = app.route else {
+        return false;
+    };
+
+    let hit = ui::screens::workspace::hit_test(area, app, mouse.column, mouse.row);
+    if !matches!(hit, Some(ui::screens::workspace::WorkspaceHit::TerminalPane)) {
+        return false;
+    }
+
+    let content =
+        ui::screens::workspace::terminal_content_rect(area, app.focus, app.terminal_fullscreen);
+    if !point_in_rect(content, mouse.column, mouse.row) {
+        return false;
+    }
+
+    let tab_id = app.active_tab_id();
+    let kind = app.active_tab_kind();
+    let Some((mode, encoding)) = app.terminal_mouse_protocol(id, &tab_id) else {
+        return false;
+    };
+    if matches!(mode, MouseProtocolMode::None) {
+        return false;
+    }
+
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        app.focus = app::Focus::WsTerminal;
+    }
+
+    let col = mouse.column.saturating_sub(content.x).saturating_add(1);
+    let row = mouse.row.saturating_sub(content.y).saturating_add(1);
+    let Some(bytes) = encode_terminal_mouse(mouse, col, row, mode, encoding) else {
+        return false;
+    };
+
+    let _ = cmd_tx
+        .send(Command::SendTerminalInput {
+            id,
+            kind,
+            tab_id: Some(tab_id),
+            data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        })
+        .await;
+    true
+}
+
+fn encode_terminal_mouse(
+    mouse: MouseEvent,
+    col: u16,
+    row: u16,
+    mode: MouseProtocolMode,
+    encoding: MouseProtocolEncoding,
+) -> Option<Vec<u8>> {
+    let modifiers = encode_mouse_modifiers(mouse.modifiers);
+    let report = match mouse.kind {
+        MouseEventKind::Down(button) => {
+            if matches!(mode, MouseProtocolMode::None) {
+                return None;
+            }
+            MouseReport {
+                cb: encode_mouse_button(button)? | modifiers,
+                release: false,
+            }
+        }
+        MouseEventKind::Up(button) => {
+            if matches!(mode, MouseProtocolMode::Press | MouseProtocolMode::None) {
+                return None;
+            }
+            let cb = if matches!(encoding, MouseProtocolEncoding::Sgr) {
+                encode_mouse_button(button)?
+            } else {
+                3
+            };
+            MouseReport {
+                cb: cb | modifiers,
+                release: matches!(encoding, MouseProtocolEncoding::Sgr),
+            }
+        }
+        MouseEventKind::Drag(button) => {
+            if !matches!(mode, MouseProtocolMode::ButtonMotion | MouseProtocolMode::AnyMotion) {
+                return None;
+            }
+            MouseReport {
+                cb: encode_mouse_button(button)? | modifiers | 32,
+                release: false,
+            }
+        }
+        MouseEventKind::Moved => {
+            if !matches!(mode, MouseProtocolMode::AnyMotion) {
+                return None;
+            }
+            MouseReport {
+                cb: 3 | modifiers | 32,
+                release: false,
+            }
+        }
+        MouseEventKind::ScrollUp => MouseReport { cb: 64 | modifiers, release: false },
+        MouseEventKind::ScrollDown => MouseReport { cb: 65 | modifiers, release: false },
+        MouseEventKind::ScrollLeft => MouseReport { cb: 66 | modifiers, release: false },
+        MouseEventKind::ScrollRight => MouseReport { cb: 67 | modifiers, release: false },
+    };
+
+    encode_mouse_report(report, col, row, encoding)
+}
+
+struct MouseReport {
+    cb: u16,
+    release: bool,
+}
+
+fn encode_mouse_button(button: MouseButton) -> Option<u16> {
+    match button {
+        MouseButton::Left => Some(0),
+        MouseButton::Middle => Some(1),
+        MouseButton::Right => Some(2),
+    }
+}
+
+fn encode_mouse_modifiers(modifiers: KeyModifiers) -> u16 {
+    let mut bits = 0;
+    if modifiers.contains(KeyModifiers::SHIFT) { bits |= 4; }
+    if modifiers.contains(KeyModifiers::ALT) { bits |= 8; }
+    if modifiers.contains(KeyModifiers::CONTROL) { bits |= 16; }
+    bits
+}
+
+fn encode_mouse_report(
+    report: MouseReport,
+    col: u16,
+    row: u16,
+    encoding: MouseProtocolEncoding,
+) -> Option<Vec<u8>> {
+    match encoding {
+        MouseProtocolEncoding::Sgr => Some(
+            format!(
+                "\x1b[<{};{};{}{}",
+                report.cb, col, row,
+                if report.release { 'm' } else { 'M' }
+            )
+            .into_bytes(),
+        ),
+        MouseProtocolEncoding::Default => {
+            let cb = u8::try_from(report.cb + 32).ok()?;
+            let cx = u8::try_from(col + 32).ok()?;
+            let cy = u8::try_from(row + 32).ok()?;
+            Some(vec![b'\x1b', b'[', b'M', cb, cx, cy])
+        }
+        MouseProtocolEncoding::Utf8 => {
+            let mut out = vec![b'\x1b', b'[', b'M'];
+            push_utf8_mouse_value(&mut out, report.cb + 32)?;
+            push_utf8_mouse_value(&mut out, col + 32)?;
+            push_utf8_mouse_value(&mut out, row + 32)?;
+            Some(out)
+        }
+    }
+}
+
+fn push_utf8_mouse_value(out: &mut Vec<u8>, value: u16) -> Option<()> {
+    let ch = char::from_u32(u32::from(value))?;
+    let mut buf = [0; 4];
+    let encoded = ch.encode_utf8(&mut buf);
+    out.extend_from_slice(encoded.as_bytes());
+    Some(())
 }
 
 /// xterm-256 colour 39 — a medium sky-blue used for mouse selection highlighting.

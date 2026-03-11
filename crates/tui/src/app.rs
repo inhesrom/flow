@@ -831,6 +831,17 @@ impl TuiApp {
         lines
     }
 
+    pub fn terminal_mouse_protocol(
+        &self,
+        id: WorkspaceId,
+        tab_id: &str,
+    ) -> Option<(vt100::MouseProtocolMode, vt100::MouseProtocolEncoding)> {
+        let state = self.terminal_state.get(&id)?;
+        let tab = state.tabs.get(tab_id)?;
+        let screen = tab.parser.screen();
+        Some((screen.mouse_protocol_mode(), screen.mouse_protocol_encoding()))
+    }
+
     pub fn tag_map(&self) -> HashMap<String, Vec<String>> {
         let mut map: HashMap<String, Vec<String>> = HashMap::new();
         if let Some(id) = self.active_workspace_id() {
