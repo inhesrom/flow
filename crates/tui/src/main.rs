@@ -2188,6 +2188,12 @@ fn key_to_terminal_bytes(key: KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Right => Some(b"\x1b[C".to_vec()),
         KeyCode::Up => Some(b"\x1b[A".to_vec()),
         KeyCode::Down => Some(b"\x1b[B".to_vec()),
+        KeyCode::Home => Some(b"\x1b[H".to_vec()),
+        KeyCode::End => Some(b"\x1b[F".to_vec()),
+        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
+        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
+        KeyCode::Insert => Some(b"\x1b[2~".to_vec()),
+        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
         _ => None,
     }
 }
@@ -2457,10 +2463,10 @@ async fn forward_mouse_to_terminal(
 
     let tab_id = app.active_tab_id();
     let kind = app.active_tab_kind();
-    let Some((mode, encoding)) = app.terminal_mouse_protocol(id, &tab_id) else {
+    let Some((mode, encoding, alternate_screen)) = app.terminal_mouse_state(id, &tab_id) else {
         return false;
     };
-    if matches!(mode, MouseProtocolMode::None) {
+    if !should_forward_mouse_event_to_terminal(mouse.kind, mode, alternate_screen) {
         return false;
     }
 
@@ -2482,6 +2488,22 @@ async fn forward_mouse_to_terminal(
             data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
         })
         .await;
+    true
+}
+
+fn should_forward_mouse_event_to_terminal(
+    kind: MouseEventKind,
+    mode: MouseProtocolMode,
+    alternate_screen: bool,
+) -> bool {
+    if matches!(mode, MouseProtocolMode::None) {
+        return false;
+    }
+
+    if matches!(kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+        return alternate_screen;
+    }
+
     true
 }
 
@@ -2604,6 +2626,78 @@ fn push_utf8_mouse_value(out: &mut Vec<u8>, value: u16) -> Option<()> {
     Some(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normal_screen_terminals_keep_wheel_events_local() {
+        assert!(!should_forward_mouse_event_to_terminal(
+            MouseEventKind::ScrollUp,
+            MouseProtocolMode::Press,
+            false,
+        ));
+        assert!(!should_forward_mouse_event_to_terminal(
+            MouseEventKind::ScrollDown,
+            MouseProtocolMode::AnyMotion,
+            false,
+        ));
+    }
+
+    #[test]
+    fn alternate_screen_terminals_receive_wheel_events() {
+        assert!(should_forward_mouse_event_to_terminal(
+            MouseEventKind::ScrollUp,
+            MouseProtocolMode::Press,
+            true,
+        ));
+    }
+
+    #[test]
+    fn mouse_clicks_still_forward_when_mouse_mode_is_enabled() {
+        assert!(should_forward_mouse_event_to_terminal(
+            MouseEventKind::Down(MouseButton::Left),
+            MouseProtocolMode::ButtonMotion,
+            false,
+        ));
+    }
+
+    #[test]
+    fn mouse_events_do_not_forward_without_mouse_mode() {
+        assert!(!should_forward_mouse_event_to_terminal(
+            MouseEventKind::Down(MouseButton::Left),
+            MouseProtocolMode::None,
+            true,
+        ));
+    }
+
+    #[test]
+    fn alternate_screen_without_mouse_mode_keeps_wheel_events_local() {
+        assert!(!should_forward_mouse_event_to_terminal(
+            MouseEventKind::ScrollUp,
+            MouseProtocolMode::None,
+            true,
+        ));
+        assert!(!should_forward_mouse_event_to_terminal(
+            MouseEventKind::ScrollDown,
+            MouseProtocolMode::None,
+            true,
+        ));
+    }
+
+    #[test]
+    fn page_navigation_keys_are_forwarded_to_terminals() {
+        assert_eq!(
+            key_to_terminal_bytes(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            Some(b"\x1b[5~".to_vec()),
+        );
+        assert_eq!(
+            key_to_terminal_bytes(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+            Some(b"\x1b[6~".to_vec()),
+        );
+    }
+}
+
 /// xterm-256 colour 39 — a medium sky-blue used for mouse selection highlighting.
 const SELECTION_BG: ratatui::style::Color = ratatui::style::Color::Indexed(39);
 
@@ -2674,4 +2768,3 @@ async fn start_workspace_tab_terminals(
             .await;
     }
 }
-

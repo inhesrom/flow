@@ -14,16 +14,15 @@ A terminal-based multi-workspace manager built with Rust.
 
 ## Architecture
 
-Anvl is organized as a Cargo workspace with four crates and a web frontend:
+Anvl is organized as a Cargo workspace with three crates:
 
 | Crate | Description |
 |---|---|
 | `protocol` | Serializable types for IPC — workspace routing, attention levels, terminal kinds, and command/event enums |
-| `core` | Application state management — workspaces, Git, terminal PTY spawning, attention detection, and async event loop |
-| `tui` | Terminal UI built with Ratatui — renders home/workspace screens, handles input, manages sessions |
-| `server` | HTTP/WebSocket server — REST endpoints, WebSocket event streaming, and embedded web app hosting |
+| `core` | Application state management — workspaces, Git, terminal PTY spawning, attention detection, SSH, and the async event loop |
+| `tui` | Terminal UI built with Ratatui — renders home/workspace screens, handles input, and manages sessions |
 
-The `web/` directory contains a lightweight browser frontend (`index.html` + `app.js`) served by the `server` crate.
+See [docs/repo-diagram.md](/Users/ianhersom/repo/anvl/docs/repo-diagram.md) for a rendered repo diagram and runtime overview.
 
 ## Getting Started
 

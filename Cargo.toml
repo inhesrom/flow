@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 default-members = ["crates/tui"]
+exclude = ["vendor/vt100"]
 members = [
   "crates/protocol",
   "crates/core",
@@ -10,5 +11,8 @@ members = [
 [profile.dev.package.vt100]
 overflow-checks = false
 
+[patch.crates-io]
+vt100 = { path = "vendor/vt100" }
+
 [workspace.package]
-version = "0.3.17"
+version = "0.3.18"

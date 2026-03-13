@@ -831,15 +831,19 @@ impl TuiApp {
         lines
     }
 
-    pub fn terminal_mouse_protocol(
+    pub fn terminal_mouse_state(
         &self,
         id: WorkspaceId,
         tab_id: &str,
-    ) -> Option<(vt100::MouseProtocolMode, vt100::MouseProtocolEncoding)> {
+    ) -> Option<(vt100::MouseProtocolMode, vt100::MouseProtocolEncoding, bool)> {
         let state = self.terminal_state.get(&id)?;
         let tab = state.tabs.get(tab_id)?;
         let screen = tab.parser.screen();
-        Some((screen.mouse_protocol_mode(), screen.mouse_protocol_encoding()))
+        Some((
+            screen.mouse_protocol_mode(),
+            screen.mouse_protocol_encoding(),
+            screen.alternate_screen(),
+        ))
     }
 
     pub fn tag_map(&self) -> HashMap<String, Vec<String>> {
@@ -2040,6 +2044,19 @@ mod tests {
         assert!(app.terminal_fullscreen);
         app.toggle_terminal_fullscreen();
         assert!(!app.terminal_fullscreen);
+    }
+
+    #[test]
+    fn vt100_keeps_scrollback_for_partial_scroll_regions() {
+        let mut parser = vt100::Parser::new(4, 4, 8);
+        parser.process(
+            b"\x1b[1;1H1111\x1b[2;1H2222\x1b[3;1H3333\x1b[4;1H4444\x1b[2;3r\x1b[3;1HAAAA\r\n",
+        );
+
+        parser.set_scrollback(1);
+        let rows = parser.screen().rows(0, 4).collect::<Vec<_>>();
+
+        assert_eq!(rows.first().map(String::as_str), Some("2222"));
     }
 
     #[test]
